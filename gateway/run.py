@@ -4709,27 +4709,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             logger.info("Drained %d inbound message(s) queued during startup restore", drained)
 
     def _schedule_resume_pending_sessions(self, platform=None) -> int:
-        """Auto-continue fresh restart-interrupted sessions after startup.
+        """Defer restart-interrupted sessions until the next real user message.
 
-        ``resume_pending`` already preserves the transcript AND the existing
-        ``_is_resume_pending`` branch in ``_handle_message_with_agent``
-        injects a reason-aware recovery system note on the next turn.  This
-        method closes the UX gap by synthesizing that next turn once
-        adapters are back online — the event text is empty so the existing
-        injection path owns the wording and we never double up.
+        ``resume_pending`` preserves the transcript and lets
+        ``_handle_message_with_agent`` inject a reason-aware recovery note on
+        the *next real user message*.  Older builds synthesized an empty
+        internal message at startup to auto-continue interrupted turns.  That
+        was unsafe for gateway/service work: if the interrupted turn was
+        itself coordinating gateway restarts, startup auto-resume could
+        re-enter the same side-effecting workflow and create a restart loop.
 
-        Adapters that are not yet ready (adapter missing from
-        ``self.adapters``) are skipped silently; their sessions stay
-        ``resume_pending`` and will auto-resume on the next real user
-        message, or when the platform reconnects — the reconnect watcher
-        calls this again scoped to that ``platform``.
-
-        ``platform`` (a ``Platform``) restricts the pass to sessions that
-        originated on that platform.  The reconnect path passes it so a
-        platform coming back online retries only its own sessions and never
-        re-touches another platform's in-flight recoveries.  Sessions whose
-        agent is already running are skipped regardless, so a session
-        scheduled at startup is never resumed a second time.
+        Keep the durable marker, but do not run the agent autonomously from an
+        empty startup event.  This preserves recovery while restoring the
+        important invariant that gateway startup/reconnect must not execute
+        user-workflow tool calls without a fresh user message.
         """
         window = _auto_continue_freshness_window()
         try:
@@ -4748,63 +4741,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return 0
 
         now = datetime.now()
-        scheduled = 0
+        deferred = 0
         for entry in candidates:
             marker = entry.last_resume_marked_at or entry.updated_at
             if marker is not None and (now - marker).total_seconds() > window:
                 continue
-
-            # Already being resumed (e.g. scheduled at startup and still
-            # in-flight) — don't synthesize a second continuation turn.
             if entry.session_key in self._running_agents:
                 continue
+            deferred += 1
 
-            source = entry.origin
-            adapter = self.adapters.get(source.platform)
-            if adapter is None:
-                logger.debug(
-                    "Skipping auto-resume for %s: adapter not ready for %s",
-                    entry.session_key,
-                    getattr(source.platform, "value", source.platform),
-                )
-                continue
-
-            # Claim the session slot *before* spawning the task so that an
-            # inbound message arriving between task creation and the task's
-            # first await (where _process_message_background sets the real
-            # sentinel) sees the slot as occupied and queues behind it
-            # instead of spinning up a duplicate AIAgent (#45456).
-            self._running_agents[entry.session_key] = _AGENT_PENDING_SENTINEL
-            self._running_agents_ts[entry.session_key] = time.time()
-
-            # Empty-text internal event — the _is_resume_pending branch in
-            # _handle_message_with_agent prepends the proper reason-aware
-            # system note before the turn runs.
-            event = MessageEvent(
-                text="",
-                message_type=MessageType.TEXT,
-                source=source,
-                internal=True,
-            )
-            task = asyncio.create_task(
-                self._run_startup_resume_event(adapter, event, entry.session_key)
-            )
-            self._background_tasks.add(task)
-            task.add_done_callback(self._background_tasks.discard)
-            if getattr(self, "_startup_restore_in_progress", False):
-                tasks = getattr(self, "_startup_restore_tasks", None)
-                if tasks is None:
-                    tasks = []
-                    self._startup_restore_tasks = tasks
-                tasks.append(task)
-            scheduled += 1
-
-        if scheduled:
+        if deferred:
             logger.info(
-                "Scheduled auto-resume for %d restart-interrupted session(s)",
-                scheduled,
+                "Deferred %d restart-interrupted session(s) until next real user message",
+                deferred,
             )
-        return scheduled
+        return 0
 
     async def start(self) -> bool:
         """

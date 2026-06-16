@@ -23,8 +23,28 @@ logger = logging.getLogger(__name__)
 
 
 def _now() -> datetime:
-    """Return the current local time."""
+    """Return the current local time as a naive datetime.
+
+    Gateway session timestamps have historically been persisted as local naive
+    ISO strings. Keep that contract so existing reset-policy comparisons remain
+    simple and local-time based.
+    """
     return datetime.now()
+
+
+def _parse_local_datetime(value: Any) -> datetime:
+    """Parse a persisted session timestamp into local naive time.
+
+    Older gateway builds could persist offset-aware ISO strings (for example
+    ``2026-06-14T03:32:24+08:00``) while current reset policy code compares
+    against ``datetime.now()``. Python correctly refuses aware-vs-naive
+    comparisons, so normalize any aware timestamp to local wall-clock time and
+    strip tzinfo at load time.
+    """
+    dt = datetime.fromisoformat(value)
+    if dt.tzinfo is not None:
+        dt = dt.astimezone().replace(tzinfo=None)
+    return dt
 
 
 # ---------------------------------------------------------------------------
@@ -560,15 +580,15 @@ class SessionEntry:
         _lrma = data.get("last_resume_marked_at")
         if _lrma:
             try:
-                last_resume_marked_at = datetime.fromisoformat(_lrma)
+                last_resume_marked_at = _parse_local_datetime(_lrma)
             except (TypeError, ValueError):
                 last_resume_marked_at = None
 
         return cls(
             session_key=data["session_key"],
             session_id=data["session_id"],
-            created_at=datetime.fromisoformat(data["created_at"]),
-            updated_at=datetime.fromisoformat(data["updated_at"]),
+            created_at=_parse_local_datetime(data["created_at"]),
+            updated_at=_parse_local_datetime(data["updated_at"]),
             origin=origin,
             display_name=data.get("display_name"),
             platform=platform,

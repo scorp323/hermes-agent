@@ -7,7 +7,7 @@ Verifies that:
 - notify_exclude_platforms skips notifications for excluded platforms
 """
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 
 from gateway.config import (
@@ -99,6 +99,32 @@ class TestShouldResetReason:
         )
         source = _make_source()
         assert store._should_reset(entry, source) is None
+
+    def test_loaded_offset_aware_timestamp_does_not_crash_reset_policy(self, tmp_path):
+        store = _make_store(
+            SessionResetPolicy(mode="idle", idle_minutes=30),
+            tmp_path,
+        )
+        source = _make_source(chat_id="aware")
+        aware_now = datetime.now(timezone.utc)
+        (tmp_path / "sessions.json").write_text(
+            '{\n'
+            '  "agent:main:telegram:dm:aware": {\n'
+            '    "session_key": "agent:main:telegram:dm:aware",\n'
+            '    "session_id": "s-aware",\n'
+            f'    "created_at": "{aware_now.isoformat()}",\n'
+            f'    "updated_at": "{aware_now.isoformat()}",\n'
+            '    "platform": "telegram",\n'
+            '    "chat_type": "dm",\n'
+            '    "origin": {"platform": "telegram", "chat_id": "aware", "chat_type": "dm", "user_id": "u1"}\n'
+            '  }\n'
+            '}\n'
+        )
+
+        entry = store.get_or_create_session(source)
+
+        assert entry.session_id == "s-aware"
+        assert entry.updated_at.tzinfo is None
 
 
 # ---------------------------------------------------------------------------
