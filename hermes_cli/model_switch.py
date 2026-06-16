@@ -1885,7 +1885,8 @@ def list_authenticated_providers(
                     "api_url": api_url,
                     "api_key": api_key,
                     "models": [],
-                    "discover_models": False,
+                    "discover_models": discover,
+                    "discover_models_explicit": False,
                 }
             else:
                 if api_key and not groups[group_key].get("api_key"):
@@ -1898,6 +1899,9 @@ def list_authenticated_providers(
                 discover_enabled = bool(discover_raw)
             if discover_raw is not None and discover_enabled:
                 groups[group_key]["discover_models"] = True
+                groups[group_key]["discover_models_explicit"] = True
+            elif discover_raw is not None and not discover_enabled:
+                groups[group_key]["discover_models"] = False
 
             # The singular ``model:`` field only holds the currently
             # active model. Hermes's own writer (main.py::_save_custom_provider)
@@ -1988,11 +1992,11 @@ def list_authenticated_providers(
             host = (urlparse(api_url).hostname or "").lower()
             is_local_endpoint = host in {"localhost", "127.0.0.1", "::1"}
             discover_enabled = bool(grp.get("discover_models", True))
+            explicit_discovery = bool(grp.get("discover_models_explicit"))
             should_probe = bool(api_url) and discover_enabled and (
                 not grp["models"]
                 or (bool(api_key) and not is_local_endpoint)
-                or bool(grp.get("discover_models"))
-
+                or explicit_discovery
             )
             if should_probe:
                 try:

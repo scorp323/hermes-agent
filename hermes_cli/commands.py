@@ -1060,7 +1060,10 @@ _SLACK_PRIORITY_ALIASES = ("btw", "bg", "reset", "q")
 # the telegram-parity test reads it so an entry here is a deliberate
 # "Slack-via-/hermes" decision, not a silent clamp.
 #   - credits: the billing/top-up surface; reached via /hermes credits on Slack.
-_SLACK_VIA_HERMES_ONLY = frozenset({"credits"})
+#   - debug/platform/update/version: lower-frequency operator/info surfaces kept
+#     reachable through /hermes so Slack's 50-command cap preserves the higher-
+#     frequency native commands and aliases.
+_SLACK_VIA_HERMES_ONLY = frozenset({"credits", "debug", "platform", "update", "version"})
 
 
 def _sanitize_slack_name(raw: str) -> str:
