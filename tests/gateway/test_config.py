@@ -916,6 +916,46 @@ class TestLoadGatewayConfig:
         import os
         assert os.environ.get("TELEGRAM_PROXY") == "socks5://from-env:1080"
 
+    def test_explicit_weixin_disabled_survives_env_credentials(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        config_path = hermes_home / "config.yaml"
+        config_path.write_text(
+            "weixin:\n"
+            "  enabled: false\n",
+            encoding="utf-8",
+        )
+
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setenv("WEIXIN_TOKEN", "test-token")
+        monkeypatch.setenv("WEIXIN_ACCOUNT_ID", "wxid_test")
+
+        config = load_gateway_config()
+
+        weixin = config.platforms[Platform.WEIXIN]
+        assert weixin.enabled is False
+        assert weixin.token == "test-token"
+        assert weixin.extra["account_id"] == "wxid_test"
+
+    def test_explicit_discord_disabled_survives_env_credentials(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        config_path = hermes_home / "config.yaml"
+        config_path.write_text(
+            "discord:\n"
+            "  enabled: false\n",
+            encoding="utf-8",
+        )
+
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "discord-token")
+
+        config = load_gateway_config()
+
+        discord = config.platforms[Platform.DISCORD]
+        assert discord.enabled is False
+        assert discord.token == "discord-token"
+
 
 class TestHomeChannelEnvOverrides:
     """Home channel env vars should apply even when the platform was already

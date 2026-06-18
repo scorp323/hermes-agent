@@ -989,7 +989,6 @@ def load_gateway_config() -> GatewayConfig:
                 plat_data, extra = _ensure_platform_extra_dict(platforms_data, plat.value)
                 if enabled_was_explicit:
                     plat_data["enabled"] = platform_cfg["enabled"]
-                if plat == Platform.SLACK and enabled_was_explicit:
                     extra["_enabled_explicit"] = True
                 extra.update(bridged)
 
@@ -1354,7 +1353,7 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
             return config.platforms[platform]
 
         platform_config = config.platforms[platform]
-        enabled_was_explicit = bool(platform_config.extra.pop("_enabled_explicit", False))
+        enabled_was_explicit = bool(platform_config.extra.get("_enabled_explicit", False))
         if not platform_config.enabled and not enabled_was_explicit:
             platform_config.enabled = True
         return platform_config
@@ -1497,7 +1496,7 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
             config.platforms[Platform.SLACK].enabled = True
         else:
             slack_config = config.platforms[Platform.SLACK]
-            enabled_was_explicit = bool(slack_config.extra.pop("_enabled_explicit", False))
+            enabled_was_explicit = bool(slack_config.extra.get("_enabled_explicit", False))
             if not slack_config.enabled and not enabled_was_explicit:
                 # Top-level Slack settings such as channel prompts should not
                 # turn an env-token setup into a disabled platform. Only an
@@ -1831,8 +1830,12 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
     weixin_account_id = os.getenv("WEIXIN_ACCOUNT_ID")
     if weixin_token or weixin_account_id:
         if Platform.WEIXIN not in config.platforms:
-            config.platforms[Platform.WEIXIN] = PlatformConfig()
-        config.platforms[Platform.WEIXIN].enabled = True
+            config.platforms[Platform.WEIXIN] = PlatformConfig(enabled=True)
+        else:
+            weixin_config = config.platforms[Platform.WEIXIN]
+            enabled_was_explicit = bool(weixin_config.extra.get("_enabled_explicit", False))
+            if not weixin_config.enabled and not enabled_was_explicit:
+                weixin_config.enabled = True
         if weixin_token:
             config.platforms[Platform.WEIXIN].token = weixin_token
         extra = config.platforms[Platform.WEIXIN].extra
@@ -2039,6 +2042,14 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
                 continue
             platform = Platform(entry.name)
             existing_cfg = config.platforms.get(platform)
+            if existing_cfg is not None and not existing_cfg.enabled and bool(
+                existing_cfg.extra.get("_enabled_explicit", False)
+            ):
+                logger.debug(
+                    "Plugin platform '%s' explicitly disabled in config — skipping enable",
+                    entry.name,
+                )
+                continue
             # Seed candidate extras from ``env_enablement_fn`` so plugins
             # whose ``is_connected`` reads ``config.extra`` (e.g. Google
             # Chat's ``_is_connected`` checks ``config.extra["project_id"]``)
