@@ -801,6 +801,7 @@ def pause_job(job_id: str, reason: Optional[str] = None) -> Optional[Dict[str, A
             "state": "paused",
             "paused_at": _hermes_now().isoformat(),
             "paused_reason": reason,
+            "next_run_at": None,
         },
     )
 
