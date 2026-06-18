@@ -4861,6 +4861,31 @@ def _platform_status(platform: dict) -> str:
     return "not configured"
 
 
+def _enabled_runtime_platform_names() -> set[str] | None:
+    """Return configured enabled platform names, or None when unavailable.
+
+    Runtime status is intentionally durable across restarts, so it may still
+    contain old fatal entries for platforms that were later explicitly disabled.
+    The status UI should not keep warning about disabled platforms.
+    """
+    try:
+        from gateway.config import load_gateway_config
+    except Exception:
+        return None
+
+    try:
+        config = load_gateway_config()
+    except Exception:
+        return None
+
+    enabled: set[str] = set()
+    for platform, platform_config in (getattr(config, "platforms", {}) or {}).items():
+        if not getattr(platform_config, "enabled", False):
+            continue
+        enabled.add(getattr(platform, "value", str(platform)))
+    return enabled
+
+
 def _runtime_health_lines() -> list[str]:
     """Summarize the latest persisted gateway runtime health state."""
     try:
@@ -4878,8 +4903,11 @@ def _runtime_health_lines() -> list[str]:
     active_agents = state.get("active_agents")
     restart_requested = state.get("restart_requested")
     platforms = state.get("platforms", {}) or {}
+    enabled_platforms = _enabled_runtime_platform_names()
 
     for platform, pdata in platforms.items():
+        if enabled_platforms is not None and platform not in enabled_platforms:
+            continue
         if pdata.get("state") == "fatal":
             message = pdata.get("error_message") or "unknown error"
             lines.append(f"⚠ {platform}: {message}")
