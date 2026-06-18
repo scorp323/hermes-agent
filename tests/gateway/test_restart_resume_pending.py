@@ -868,11 +868,12 @@ async def test_drain_timeout_skips_pending_sentinel_sessions():
 
 
 @pytest.mark.asyncio
-async def test_startup_auto_resume_schedules_fresh_pending_sessions():
-    """Fresh resume_pending sessions should continue automatically after startup.
+async def test_startup_auto_resume_defers_fresh_pending_sessions():
+    """Fresh resume_pending sessions wait for a real user message after startup.
 
-    This closes the UX gap where restart recovery only happened if the user sent
-    another message after the gateway came back.
+    Startup must not synthesize an empty turn because interrupted work may have
+    side effects (for example a rolling gateway restart coordinator).  The
+    durable marker remains so the next real user message gets the recovery note.
     """
     runner, adapter = make_restart_runner()
     source = make_restart_source(chat_id="resume-chat", thread_id="topic-1")
@@ -894,28 +895,14 @@ async def test_startup_auto_resume_schedules_fresh_pending_sessions():
     scheduled = runner._schedule_resume_pending_sessions()
     await asyncio.sleep(0)
 
-    assert scheduled == 1
-    adapter.handle_message.assert_awaited_once()
-    event = adapter.handle_message.await_args.args[0]
-    assert isinstance(event, MessageEvent)
-    assert event.internal is True
-    assert event.message_type == MessageType.TEXT
-    assert event.source == source
-    # Text is empty — the existing _is_resume_pending branch in
-    # _handle_message_with_agent owns the system-note injection so we don't
-    # double it up.
-    assert event.text == ""
+    assert scheduled == 0
+    adapter.handle_message.assert_not_called()
+    assert runner.session_store._entries[pending_entry.session_key].resume_pending is True
 
 
 @pytest.mark.asyncio
-async def test_startup_auto_resume_includes_crash_recovery():
-    """Crash-recovered sessions (reason=restart_interrupted) are also auto-resumed.
-
-    suspend_recently_active() marks in-flight sessions with resume_reason
-    "restart_interrupted" when the previous gateway exit was not clean
-    (crash/SIGKILL/OOM).  These should get the same magic continuation as
-    drain-timeout interruptions.
-    """
+async def test_startup_auto_resume_defers_crash_recovery():
+    """Crash-recovered sessions also wait for a real user message."""
     runner, adapter = make_restart_runner()
     source = make_restart_source(chat_id="crash-chat")
     pending_entry = SessionEntry(
@@ -936,8 +923,8 @@ async def test_startup_auto_resume_includes_crash_recovery():
     scheduled = runner._schedule_resume_pending_sessions()
     await asyncio.sleep(0)
 
-    assert scheduled == 1
-    adapter.handle_message.assert_awaited_once()
+    assert scheduled == 0
+    adapter.handle_message.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -1069,16 +1056,8 @@ async def test_startup_auto_resume_skips_when_adapter_unavailable():
 
 
 @pytest.mark.asyncio
-async def test_reconnect_reschedules_pending_after_late_platform_connect():
-    """A platform offline at startup gets its pending sessions auto-resumed
-    once it reconnects.
-
-    Regression: the startup pass skips sessions whose adapter isn't connected
-    yet (see test_startup_auto_resume_skips_when_adapter_unavailable). Before
-    the fix those sessions were never rescheduled and recovered only if the
-    user sent a fresh message — the documented startup auto-resume silently
-    dropped. The reconnect watcher now retries the platform-scoped pass.
-    """
+async def test_reconnect_keeps_pending_session_deferred():
+    """A reconnect must not synthesize an empty auto-resume turn either."""
     runner, adapter = make_restart_runner()
     source = make_restart_source(chat_id="late-chat")
     pending_entry = SessionEntry(
@@ -1101,19 +1080,14 @@ async def test_reconnect_reschedules_pending_after_late_platform_connect():
     assert runner._schedule_resume_pending_sessions() == 0
     adapter.handle_message.assert_not_called()
 
-    # Platform reconnects → its pending session is retried.
+    # Platform reconnects → pending session remains marked but is not run.
     runner.adapters = {Platform.TELEGRAM: adapter}
     scheduled = runner._schedule_resume_pending_sessions(platform=Platform.TELEGRAM)
     await asyncio.sleep(0)
 
-    assert scheduled == 1
-    adapter.handle_message.assert_awaited_once()
-    event = adapter.handle_message.await_args.args[0]
-    assert isinstance(event, MessageEvent)
-    assert event.internal is True
-    assert event.message_type == MessageType.TEXT
-    assert event.text == ""
-    assert event.source == source
+    assert scheduled == 0
+    adapter.handle_message.assert_not_called()
+    assert runner.session_store._entries[pending_entry.session_key].resume_pending is True
 
 
 @pytest.mark.asyncio
@@ -1159,12 +1133,11 @@ async def test_reconnect_reschedule_is_platform_scoped():
     scheduled = runner._schedule_resume_pending_sessions(platform=Platform.TELEGRAM)
     await asyncio.sleep(0)
 
-    # Only the telegram session is resumed; the discord session waits for its
-    # own reconnect.
-    assert scheduled == 1
-    adapter.handle_message.assert_awaited_once()
-    event = adapter.handle_message.await_args.args[0]
-    assert event.source == tg_source
+    # Neither session is resumed autonomously; both wait for real user input.
+    assert scheduled == 0
+    adapter.handle_message.assert_not_called()
+    assert runner.session_store._entries[tg_entry.session_key].resume_pending is True
+    assert runner.session_store._entries[discord_entry.session_key].resume_pending is True
 
 
 @pytest.mark.asyncio
@@ -1216,8 +1189,8 @@ async def test_startup_restore_gate_queues_real_inbound_messages():
 
 
 @pytest.mark.asyncio
-async def test_startup_restore_waits_for_resume_before_draining_inbound():
-    """Queued inbound turns replay only after startup resume tasks finish."""
+async def test_startup_restore_drains_inbound_without_auto_resume_tasks():
+    """Queued inbound turns replay after the startup restore gate opens."""
     runner, adapter = make_restart_runner()
     runner._startup_restore_in_progress = True
     runner._startup_restore_queue = []
@@ -1238,15 +1211,9 @@ async def test_startup_restore_waits_for_resume_before_draining_inbound():
     )
     runner.session_store._entries = {pending_entry.session_key: pending_entry}
 
-    resume_done = asyncio.Event()
     seen: list[str] = []
 
     async def fake_handle_message(event: MessageEvent) -> None:
-        if event.internal:
-            seen.append("resume-start")
-            task = asyncio.create_task(resume_done.wait())
-            adapter._session_tasks[pending_entry.session_key] = task
-            return
         seen.append(f"inbound:{event.text}")
 
     adapter.handle_message = fake_handle_message
@@ -1260,18 +1227,13 @@ async def test_startup_restore_waits_for_resume_before_draining_inbound():
         source=source,
     )
     assert await runner._handle_message(inbound) is None
-    assert scheduled == 1
-    assert seen == ["resume-start"]
+    assert scheduled == 0
+    assert seen == []
     assert runner._startup_restore_queue == [inbound]
 
-    finish_task = asyncio.create_task(runner._finish_startup_restore())
-    await asyncio.sleep(0)
-    assert seen == ["resume-start"]
+    await runner._finish_startup_restore()
 
-    resume_done.set()
-    await finish_task
-
-    assert seen == ["resume-start", "inbound:hello"]
+    assert seen == ["inbound:hello"]
     assert runner._startup_restore_queue == []
     assert runner._startup_restore_in_progress is False
 
@@ -1547,18 +1509,13 @@ async def test_auto_resume_sets_sentinel_before_task_execution():
 
     scheduled = runner._schedule_resume_pending_sessions()
 
-    assert scheduled == 1
-    # The sentinel must be set immediately — before the task starts executing.
-    assert pending_entry.session_key in runner._running_agents
-    assert runner._running_agents[pending_entry.session_key] is _AGENT_PENDING_SENTINEL
-    assert pending_entry.session_key in runner._running_agents_ts
-
-    # Release the task and let it complete.
-    gate.set()
-    await asyncio.sleep(0.05)
-
-    # After the task completes, the sentinel should be cleaned up.
+    assert scheduled == 0
+    # Startup/reconnect no longer pre-claims or starts an autonomous resume
+    # task; the marker is consumed only by the next real user message.
     assert pending_entry.session_key not in runner._running_agents
+    assert pending_entry.session_key not in runner._running_agents_ts
+    gate.set()
+    await asyncio.sleep(0)
 
 
 @pytest.mark.asyncio
@@ -1588,16 +1545,12 @@ async def test_auto_resume_sentinel_cleaned_on_task_failure():
     adapter.handle_message = _failing_handle
 
     scheduled = runner._schedule_resume_pending_sessions()
-    assert scheduled == 1
+    assert scheduled == 0
 
-    # Sentinel is set immediately.
-    assert pending_entry.session_key in runner._running_agents
-
-    # Let the task run and fail.
-    await asyncio.sleep(0.05)
-
-    # The sentinel must be cleaned up despite the failure.
+    # No task was started, so there is no sentinel to clean up and no adapter
+    # failure path to exercise during startup.
     assert pending_entry.session_key not in runner._running_agents
+    await asyncio.sleep(0)
 
 
 @pytest.mark.asyncio
@@ -1684,18 +1637,13 @@ async def test_auto_resume_runs_agent_exactly_once_through_full_path():
     adapter._run_processing_hook = AsyncMock()
 
     scheduled = runner._schedule_resume_pending_sessions()
-    assert scheduled == 1
-    # Pre-claim must be visible immediately.
-    assert runner._running_agents.get(session_key) is _AGENT_PENDING_SENTINEL
+    assert scheduled == 0
+    # No pre-claim and no autonomous resume run.
+    assert runner._running_agents.get(session_key) is None
 
-    # Let the guarded task, the background task, and the late-arrival
-    # drain task all settle.
-    for _ in range(20):
+    for _ in range(3):
         await asyncio.sleep(0.02)
 
-    # Exactly one agent run for the resumed session — not zero (the
-    # pre-claim did not swallow the resume) and not two (no duplicate).
-    assert agent_runs == [session_key]
-    # No leaked sentinel and no orphaned queued event.
+    assert agent_runs == []
     assert session_key not in runner._running_agents
     assert session_key not in getattr(adapter, "_pending_messages", {})

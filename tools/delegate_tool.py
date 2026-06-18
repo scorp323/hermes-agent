@@ -17,6 +17,7 @@ never the child's intermediate tool calls or reasoning.
 """
 
 import enum
+import ipaddress
 import json
 import logging
 
@@ -29,6 +30,7 @@ from concurrent.futures import (
     TimeoutError as FuturesTimeoutError,
 )
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse
 
 from toolsets import TOOLSETS
 
@@ -130,6 +132,16 @@ _SUBAGENT_TOOLSETS = sorted(
 _TOOLSET_LIST_STR = ", ".join(f"'{n}'" for n in _SUBAGENT_TOOLSETS)
 
 _DEFAULT_MAX_CONCURRENT_CHILDREN = 3
+_LOCAL_DELEGATION_MAX_CONCURRENT_CHILDREN = 1
+_LOCAL_DELEGATION_DEFAULT_CHILD_TIMEOUT = 120.0
+_LOCAL_DELEGATION_MAX_CHILD_TIMEOUT = 120.0
+_LOCAL_DELEGATION_MAX_ITERATIONS = 12
+_LOCAL_DELEGATION_PROVIDERS = {
+    "litellm-qwen", "ollama", "ollama-local", "mlx", "mlx-local", "lmstudio", "local",
+}
+_LOCAL_DELEGATION_MODEL_PREFIXES = (
+    "qwen", "glm", "llama", "mistral", "phi", "deepseek", "gemma", "gpt-oss", "codellama", "yi",
+)
 MAX_DEPTH = 1  # flat by default: parent (0) -> child (1); grandchild rejected unless max_spawn_depth raised.
 # Configurable depth cap consulted by _get_max_spawn_depth; MAX_DEPTH
 # stays as the default fallback and is still the symbol tests import.
@@ -359,20 +371,118 @@ def _normalize_role(r: Optional[str]) -> str:
     return "leaf"
 
 
+def _route_text(value: Any) -> str:
+    return str(value or "").strip().lower()
+
+
+def _local_base_url(base_url: Any) -> bool:
+    """True for loopback/LAN/local-network model endpoints."""
+    text = _route_text(base_url)
+    if not text:
+        return False
+    try:
+        host = urlparse(text).hostname or base_url_hostname(text) or text
+    except Exception:
+        host = text
+    host = _route_text(host).strip("[]")
+    if host in {"localhost", "host.docker.internal", "docker.for.mac.localhost"}:
+        return True
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return (
+        ip.is_loopback
+        or ip.is_private
+        or ip.is_link_local
+        or ip.is_unspecified
+        or ip in ipaddress.ip_network("100.64.0.0/10")  # Tailscale/CGNAT local-infra routes
+    )
+
+
+def _local_model_family(model: Any) -> bool:
+    text = _route_text(model).split("/", 1)[-1]
+    return text.startswith(_LOCAL_DELEGATION_MODEL_PREFIXES)
+
+
+def _effective_delegation_route(cfg: Optional[dict]) -> tuple[str, str, str]:
+    cfg = cfg or {}
+    provider = _route_text(cfg.get("provider") or cfg.get("_main_provider"))
+    base_url = _route_text(cfg.get("base_url") or cfg.get("_main_base_url"))
+    model = _route_text(cfg.get("model") or cfg.get("_main_model") or cfg.get("_main_default"))
+    return provider, base_url, model
+
+
+def _is_local_delegation_config(cfg: Optional[dict] = None) -> bool:
+    """Return True when delegation effectively targets a local model route.
+
+    Delegation may inherit the main agent's model when the ``delegation`` block
+    omits provider/base_url/model. Inspect the effective route, not only the
+    explicit delegation block, so local-worker safety caps do not silently fail
+    open on inherited local profiles.
+    """
+    if cfg is None:
+        cfg = _load_config()
+    provider, base_url, model = _effective_delegation_route(cfg)
+    if provider in _LOCAL_DELEGATION_PROVIDERS:
+        return True
+    if _local_base_url(base_url):
+        return True
+    # Model-family heuristic is only safe for custom/inherited routes. Cloud
+    # providers like OpenRouter can legitimately serve qwen/deepseek/etc. and
+    # must not be capped unless their provider/base_url is local-ish.
+    return _local_model_family(model) and provider in {"", "custom"}
+
+
+def _get_local_int_cap(cfg: dict, key: str, default: int, floor: int = 1) -> int:
+    try:
+        return max(floor, int(cfg.get(key, default)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _get_local_timeout_cap(cfg: dict) -> float:
+    try:
+        configured = float(
+            cfg.get("local_child_timeout_seconds", _LOCAL_DELEGATION_DEFAULT_CHILD_TIMEOUT)
+        )
+    except (TypeError, ValueError):
+        configured = _LOCAL_DELEGATION_DEFAULT_CHILD_TIMEOUT
+    return min(max(30.0, configured), _LOCAL_DELEGATION_MAX_CHILD_TIMEOUT)
+
+
 def _get_max_concurrent_children() -> int:
     """Read delegation.max_concurrent_children from config, falling back to
     DELEGATION_MAX_CONCURRENT_CHILDREN env var, then the default (3).
 
-    Users can raise this as high as they want; only the floor (1) is enforced.
+    Cloud/frontier routes can be raised deliberately. Local model routes are
+    capped separately so a weak worker cannot fan out and wedge the parent
+    gateway.
 
     Uses the same ``_load_config()`` path that the rest of ``delegate_task``
     uses, keeping config priority consistent (config.yaml > env > default).
     """
     cfg = _load_config()
+    local_cap: Optional[int] = None
+    if _is_local_delegation_config(cfg):
+        local_cap = _get_local_int_cap(
+            cfg,
+            "local_max_concurrent_children",
+            _LOCAL_DELEGATION_MAX_CONCURRENT_CHILDREN,
+        )
     val = cfg.get("max_concurrent_children")
     if val is not None:
         try:
             result = max(1, int(val))
+            if local_cap is not None:
+                capped = min(result, local_cap)
+                if capped < result:
+                    logger.warning(
+                        "Local delegation fan-out capped: max_concurrent_children=%d -> %d",
+                        result,
+                        capped,
+                    )
+                return capped
             if result > 10:
                 logger.warning(
                     "delegation.max_concurrent_children=%d: each child consumes API tokens "
@@ -387,14 +497,15 @@ def _get_max_concurrent_children() -> int:
                 val,
                 _DEFAULT_MAX_CONCURRENT_CHILDREN,
             )
-            return _DEFAULT_MAX_CONCURRENT_CHILDREN
+            return local_cap or _DEFAULT_MAX_CONCURRENT_CHILDREN
     env_val = os.getenv("DELEGATION_MAX_CONCURRENT_CHILDREN")
     if env_val:
         try:
-            return max(1, int(env_val))
+            result = max(1, int(env_val))
+            return min(result, local_cap) if local_cap is not None else result
         except (TypeError, ValueError):
-            return _DEFAULT_MAX_CONCURRENT_CHILDREN
-    return _DEFAULT_MAX_CONCURRENT_CHILDREN
+            return local_cap or _DEFAULT_MAX_CONCURRENT_CHILDREN
+    return local_cap or _DEFAULT_MAX_CONCURRENT_CHILDREN
 
 
 _DEFAULT_MAX_ASYNC_CHILDREN = 3
@@ -435,19 +546,19 @@ def _get_child_timeout() -> Optional[float]:
     Returns the number of seconds a single child agent is allowed to run
     before being cut off, or ``None`` when no wall-clock cap applies.
 
-    Default: ``None`` (no timeout). Subagents doing legitimate heavy work
-    (deep code review, large research fan-outs, slow reasoning models) were
-    routinely killed mid-task by the old blanket cap even though they were
-    making steady progress. Failures should come from what the child is
-    actually doing — API errors, tool errors, iteration budget — not from a
-    generic delegation-level stopwatch. Stuck-child protection is handled
-    separately by the heartbeat staleness monitor, which stops refreshing
-    parent activity so the gateway inactivity timeout can fire.
+    Default for cloud/frontier routes: ``None`` (no timeout). Subagents doing
+    legitimate heavy work should not be killed by a generic stopwatch. Local
+    model routes are the exception: they get a short wall-clock cap by default
+    because local workers are more likely to hang or loop in a way that masks
+    the parent gateway's real state.
 
     Set ``delegation.child_timeout_seconds`` to a positive number to opt back
-    in to a hard cap (floor 30 s); ``0`` or a negative value means disabled.
+    in to a hard cap (floor 30 s); ``0`` or a negative value means disabled for
+    cloud routes but still resolves to the local cap for local routes.
     """
     cfg = _load_config()
+    is_local = _is_local_delegation_config(cfg)
+    local_timeout = _get_local_timeout_cap(cfg) if is_local else None
     val = cfg.get("child_timeout_seconds")
     if val is not None:
         try:
@@ -455,10 +566,15 @@ def _get_child_timeout() -> Optional[float]:
         except (TypeError, ValueError):
             logger.warning(
                 "delegation.child_timeout_seconds=%r is not a valid number; "
-                "using default (no timeout)",
+                "using default%s",
                 val,
+                " local timeout" if is_local else " (no timeout)",
             )
         else:
+            if is_local:
+                if parsed <= 0:
+                    return local_timeout
+                return min(max(30.0, parsed), local_timeout or _LOCAL_DELEGATION_MAX_CHILD_TIMEOUT)
             return None if parsed <= 0 else max(30.0, parsed)
     env_val = os.getenv("DELEGATION_CHILD_TIMEOUT_SECONDS")
     if env_val:
@@ -467,8 +583,12 @@ def _get_child_timeout() -> Optional[float]:
         except (TypeError, ValueError):
             pass
         else:
+            if is_local:
+                if parsed <= 0:
+                    return local_timeout
+                return min(max(30.0, parsed), local_timeout or _LOCAL_DELEGATION_MAX_CHILD_TIMEOUT)
             return None if parsed <= 0 else max(30.0, parsed)
-    return DEFAULT_CHILD_TIMEOUT
+    return local_timeout if is_local else DEFAULT_CHILD_TIMEOUT
 
 
 def _get_max_spawn_depth() -> int:
@@ -2136,6 +2256,14 @@ def delegate_task(
     # Load config
     cfg = _load_config()
     default_max_iter = cfg.get("max_iterations", DEFAULT_MAX_ITERATIONS)
+    if _is_local_delegation_config(cfg):
+        try:
+            default_max_iter = min(
+                int(default_max_iter),
+                _get_local_int_cap(cfg, "local_max_iterations", _LOCAL_DELEGATION_MAX_ITERATIONS),
+            )
+        except (TypeError, ValueError):
+            default_max_iter = _LOCAL_DELEGATION_MAX_ITERATIONS
     # Model-supplied max_iterations is ignored — the config value is authoritative
     # so users get predictable budgets. The kwarg is retained for internal callers
     # and tests; a model-emitted value here would only shrink the budget and
@@ -2762,27 +2890,49 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
     }
 
 
+def _with_main_route_metadata(full: dict, delegation_cfg: dict) -> dict:
+    """Attach inherited main-model route metadata to delegation config.
+
+    Existing callers expect ``_load_config()`` to return only the ``delegation``
+    block. Local-route safety needs the inherited main route too, because an
+    empty delegation provider/base_url means child agents inherit the parent
+    model. Use private keys so user-facing delegation config semantics remain
+    unchanged.
+    """
+    cfg = dict(delegation_cfg or {})
+    model_cfg = full.get("model") if isinstance(full, dict) else {}
+    if isinstance(model_cfg, dict):
+        cfg.setdefault("_main_provider", model_cfg.get("provider") or "")
+        cfg.setdefault("_main_base_url", model_cfg.get("base_url") or "")
+        cfg.setdefault("_main_model", model_cfg.get("default") or model_cfg.get("name") or "")
+    elif model_cfg:
+        cfg.setdefault("_main_model", str(model_cfg))
+    return cfg
+
+
 def _load_config() -> dict:
     """Load delegation config from CLI_CONFIG or persistent config.
 
     Checks the runtime config (cli.py CLI_CONFIG) first, then falls back
     to the persistent config (hermes_cli/config.py load_config()) so that
     ``delegation.model`` / ``delegation.provider`` are picked up regardless
-    of the entry point (CLI, gateway, cron).
+    of the entry point (CLI, gateway, cron). The returned dict also includes
+    private ``_main_*`` keys for inherited-route safety checks.
     """
     try:
         from cli import CLI_CONFIG
 
-        cfg = CLI_CONFIG.get("delegation") or {}
+        full = CLI_CONFIG or {}
+        cfg = full.get("delegation") or {}
         if cfg:
-            return cfg
+            return _with_main_route_metadata(full, cfg)
     except Exception:
         pass
     try:
         from hermes_cli.config import load_config
 
         full = load_config()
-        return full.get("delegation") or {}
+        return _with_main_route_metadata(full, full.get("delegation") or {})
     except Exception:
         return {}
 

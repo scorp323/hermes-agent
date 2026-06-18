@@ -913,6 +913,66 @@ class TestBlockedTools(unittest.TestCase):
         self.assertEqual(_MIN_SPAWN_DEPTH, 1)
 
 
+class TestLocalDelegationSafetyCaps(unittest.TestCase):
+    """Local inherited routes are bounded; cloud routes remain operator-configurable."""
+
+    def test_inherited_loopback_route_caps_fanout_timeout_and_iterations(self):
+        from tools.delegate_tool import (
+            _get_child_timeout,
+            _is_local_delegation_config,
+        )
+
+        local_cfg = {
+            "max_concurrent_children": 8,
+            "max_iterations": 90,
+            "child_timeout_seconds": 0,
+            "_main_provider": "custom",
+            "_main_base_url": "http://127.0.0.1:8093/v1",
+            "_main_model": "qwen3-coder",
+        }
+        self.assertTrue(_is_local_delegation_config(local_cfg))
+        with patch("tools.delegate_tool._load_config", return_value=local_cfg):
+            self.assertEqual(_get_max_concurrent_children(), 1)
+            self.assertEqual(_get_child_timeout(), 120.0)
+
+        parent = _make_mock_parent(depth=0)
+        child = MagicMock()
+        creds = {
+            "model": None,
+            "provider": None,
+            "base_url": None,
+            "api_key": None,
+            "api_mode": None,
+            "command": None,
+            "args": [],
+        }
+        with patch("tools.delegate_tool._load_config", return_value=local_cfg), \
+             patch("tools.delegate_tool._resolve_delegation_credentials", return_value=creds), \
+             patch("tools.delegate_tool._build_child_agent", return_value=child) as mock_build, \
+             patch("tools.delegate_tool._run_single_child", return_value={"status": "completed", "summary": "ok"}):
+            result = json.loads(delegate_task(goal="bounded local child", parent_agent=parent))
+
+        self.assertEqual(result["results"][0]["status"], "completed")
+        self.assertEqual(mock_build.call_args.kwargs["max_iterations"], 12)
+
+    def test_cloud_provider_serving_qwen_is_not_local_capped(self):
+        from tools.delegate_tool import (
+            _get_child_timeout,
+            _is_local_delegation_config,
+        )
+
+        cloud_cfg = {
+            "max_concurrent_children": 5,
+            "model": "qwen/qwen3-coder",
+            "provider": "openrouter",
+            "base_url": "https://openrouter.ai/api/v1",
+        }
+        self.assertFalse(_is_local_delegation_config(cloud_cfg))
+        with patch("tools.delegate_tool._load_config", return_value=cloud_cfg):
+            self.assertEqual(_get_max_concurrent_children(), 5)
+            self.assertIsNone(_get_child_timeout())
+
+
 class TestDelegationCredentialResolution(unittest.TestCase):
     """Tests for provider:model credential resolution in delegation config."""
 
@@ -1893,20 +1953,21 @@ class TestDelegateHeartbeat(unittest.TestCase):
         }
 
         def slow_run(**kwargs):
-            # Long enough to exceed the OLD idle threshold (5 cycles) at
-            # the patched interval, but shorter than the new in-tool
-            # threshold.
-            time.sleep(0.4)
+            # Long enough to exceed the old idle threshold at the patched
+            # interval, even after thread/executor startup overhead, but still
+            # shorter than the in-tool threshold.
+            time.sleep(0.8)
             return {"final_response": "done", "completed": True, "api_calls": 1}
 
         child.run_conversation.side_effect = slow_run
 
-        # Patch both the interval AND the idle ceiling so the test proves
-        # the in-tool branch takes effect: with a 0.05s interval and the
-        # default _HEARTBEAT_STALE_CYCLES_IDLE=5, the old behavior would
-        # trip after 0.25s and stop firing. We should see heartbeats
-        # continuing through the full 0.4s run.
-        with patch("tools.delegate_tool._HEARTBEAT_INTERVAL", 0.05):
+        # Patch interval and thresholds so the test proves the in-tool branch
+        # takes effect: if current_tool were ignored, stale detection would stop
+        # heartbeats at the tight idle ceiling (3 cycles). The in-tool ceiling
+        # remains above this short run, so heartbeats should continue past 3.
+        with patch("tools.delegate_tool._HEARTBEAT_INTERVAL", 0.05), \
+             patch("tools.delegate_tool._HEARTBEAT_STALE_CYCLES_IDLE", 3), \
+             patch("tools.delegate_tool._HEARTBEAT_STALE_CYCLES_IN_TOOL", 30):
             _run_single_child(
                 task_index=0,
                 goal="Test long-running tool",
@@ -1914,13 +1975,13 @@ class TestDelegateHeartbeat(unittest.TestCase):
                 parent_agent=parent,
             )
 
-        # With the old idle threshold (5 cycles = 0.25s), touch_calls
-        # would cap at ~5. With the in-tool threshold (20 cycles = 1.0s),
-        # we should see substantially more heartbeats over 0.4s.
+        # If the stale branch used the idle ceiling while current_tool was set,
+        # touch_calls would cap at 3. Seeing more than 3 proves the in-tool
+        # branch kept the parent activity heartbeat alive.
         self.assertGreater(
-            len(touch_calls), 6,
+            len(touch_calls), 3,
             f"Heartbeat stopped too early while child was inside a tool; "
-            f"got {len(touch_calls)} touches over 0.4s at 0.05s interval",
+            f"got {len(touch_calls)} touches at 0.05s interval",
         )
 
 

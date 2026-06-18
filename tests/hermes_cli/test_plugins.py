@@ -1,5 +1,6 @@
 """Tests for the Hermes plugin system (hermes_cli.plugins)."""
 
+import json
 import logging
 import sys
 import types
@@ -981,6 +982,66 @@ class TestPluginContext:
 
         from tools.registry import registry
         assert "plugin_echo" in registry._tools
+
+    def test_opus_delegate_registers_own_toolset_not_core(self):
+        """Bundled Opus delegation must stay plugin/per-profile scoped."""
+        from toolsets import _HERMES_CORE_TOOLS
+        from plugins.opus_delegate import register
+
+        calls = []
+
+        class CaptureContext:
+            def register_tool(self, **kwargs):
+                calls.append(kwargs)
+
+        assert "opus_delegate" not in _HERMES_CORE_TOOLS
+        register(CaptureContext())
+        assert calls[0]["name"] == "opus_delegate"
+        assert calls[0]["toolset"] == "opus_delegate"
+
+    def test_opus_delegate_perspective_is_read_only_and_strips_api_key(self, tmp_path, monkeypatch):
+        """Perspective mode runs Claude Code read-only and avoids API billing env."""
+        from plugins.opus_delegate.tools import opus_delegate
+
+        proc = types.SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps({"result": "review ok"}),
+            stderr="",
+        )
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "metered-key")
+        with patch("plugins.opus_delegate.tools._resolve_bin", return_value="/bin/claude"), \
+             patch("plugins.opus_delegate.tools.subprocess.run", return_value=proc) as mock_run:
+            result = opus_delegate(task="review this", mode="perspective", cwd=str(tmp_path))
+
+        payload = json.loads(result)
+        assert payload["result"] == "review ok"
+        assert payload["mode"] == "perspective"
+        cmd = mock_run.call_args.args[0]
+        assert "--permission-mode" in cmd
+        assert cmd[cmd.index("--permission-mode") + 1] == "default"
+        assert "Edit" not in cmd
+        assert "Write" not in cmd
+        assert "ANTHROPIC_API_KEY" not in mock_run.call_args.kwargs["env"]
+
+    def test_opus_delegate_work_mode_uses_approval_callback_and_fails_closed(self, tmp_path):
+        """Work mode is approval-gated and denial prevents subprocess launch."""
+        from plugins.opus_delegate.tools import opus_delegate
+
+        callback = object()
+        approval_calls = []
+
+        def deny(**kwargs):
+            approval_calls.append(kwargs)
+            return "deny"
+
+        with patch("tools.terminal_tool._get_approval_callback", return_value=callback), \
+             patch("tools.approval.prompt_dangerous_approval", side_effect=deny), \
+             patch("plugins.opus_delegate.tools.subprocess.run") as mock_run:
+            result = json.loads(opus_delegate(task="edit files", mode="work", cwd=str(tmp_path)))
+
+        assert "not approved" in result["error"]
+        assert approval_calls[0]["approval_callback"] is callback
+        mock_run.assert_not_called()
 
     def test_register_tool_rejects_shadow_without_override(self, tmp_path, monkeypatch, caplog):
         """Without override=True, registering a tool name claimed by a different toolset is rejected."""

@@ -1,0 +1,7 @@
+name: opus_delegate
+version: 0.1.0
+description: "Delegate tasks to Claude Code running Opus 4.8 on M4 via the Claude subscription (no API billing). mode='perspective' (read-only Opus opinion) or mode='work' (full edit+shell, approval-gated, fail-closed). Registers the `opus_delegate` tool into its own per-profile `opus_delegate` toolset."
+author: Nathan
+kind: standalone
+provides_tools:
+  - opus_delegate
