@@ -569,6 +569,52 @@ class GatewaySlashCommandsMixin:
 
         return "\n".join(lines)
 
+    async def _handle_routines_command(self, event: MessageEvent) -> str:
+        """Handle /routines — read-only cron/service routine summary."""
+        from hermes_cli.routines import build_routines_report
+
+        raw_args = event.get_command_args().strip() if event else ""
+        try:
+            tokens = shlex.split(raw_args)
+        except ValueError as exc:
+            return f"❌ Invalid /routines arguments: {exc}"
+
+        include_disabled = False
+        include_launchd = True
+        limit = 12
+        idx = 0
+        while idx < len(tokens):
+            token = tokens[idx]
+            if token in {"--all", "all"}:
+                include_disabled = True
+            elif token in {"--no-launchd", "--no_launchd"}:
+                include_launchd = False
+            elif token == "--limit":
+                idx += 1
+                if idx >= len(tokens):
+                    return "❌ /routines --limit requires a number"
+                try:
+                    limit = int(tokens[idx])
+                except ValueError:
+                    return "❌ /routines --limit requires a number"
+            elif token.startswith("--limit="):
+                try:
+                    limit = int(token.split("=", 1)[1])
+                except ValueError:
+                    return "❌ /routines --limit requires a number"
+            else:
+                return "❌ Usage: /routines [--all] [--limit N] [--no-launchd]"
+            idx += 1
+
+        report = build_routines_report(
+            include_disabled=include_disabled,
+            limit=limit,
+            include_launchd=include_launchd,
+        )
+        if len(report) > 3800:
+            report = report[:3800] + "\n… truncated; use --limit N for a smaller report"
+        return report
+
     @staticmethod
     def _redact_matrix_session_key(session_key: str) -> str:
         """Return a stable Matrix session-key fingerprint for shared room status."""

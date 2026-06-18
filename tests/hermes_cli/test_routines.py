@@ -1,6 +1,8 @@
 import json
 from types import SimpleNamespace
 
+import pytest
+
 from hermes_cli import routines
 
 
@@ -48,3 +50,42 @@ def test_cmd_routines_prints(monkeypatch, capsys, tmp_path):
     out = capsys.readouterr().out
     assert "Routine status" in out
     assert "no cron jobs" in out
+
+
+@pytest.mark.asyncio
+async def test_gateway_routines_handler_wires_read_only_report(monkeypatch):
+    from gateway.config import Platform
+    from gateway.platforms.base import MessageEvent
+    from gateway.session import SessionSource
+    from gateway.slash_commands import GatewaySlashCommandsMixin
+
+    calls = []
+
+    def fake_report(*, include_disabled, limit, include_launchd):
+        calls.append((include_disabled, limit, include_launchd))
+        return "## Routine status\n- ok"
+
+    monkeypatch.setattr(routines, "build_routines_report", fake_report)
+
+    source = SessionSource(platform=Platform.TELEGRAM, user_id="u1", chat_id="c1", chat_type="dm")
+    event = MessageEvent(text="/routines --all --limit 7 --no-launchd", source=source, message_id="m1")
+    runner = object.__new__(GatewaySlashCommandsMixin)
+    result = await runner._handle_routines_command(event)
+
+    assert result == "## Routine status\n- ok"
+    assert calls == [(True, 7, False)]
+
+
+@pytest.mark.asyncio
+async def test_gateway_routines_handler_rejects_bad_limit():
+    from gateway.config import Platform
+    from gateway.platforms.base import MessageEvent
+    from gateway.session import SessionSource
+    from gateway.slash_commands import GatewaySlashCommandsMixin
+
+    source = SessionSource(platform=Platform.TELEGRAM, user_id="u1", chat_id="c1", chat_type="dm")
+    event = MessageEvent(text="/routines --limit nope", source=source, message_id="m1")
+    runner = object.__new__(GatewaySlashCommandsMixin)
+    result = await runner._handle_routines_command(event)
+
+    assert "requires a number" in result
