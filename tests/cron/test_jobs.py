@@ -327,15 +327,20 @@ class TestUpdateJob:
 
 
 class TestPauseResumeJob:
-    def test_pause_sets_state(self, tmp_cron_dir):
+    def test_pause_sets_state_and_clears_next_run(self, tmp_cron_dir):
         job = create_job(prompt="Pause me", schedule="every 1h")
+        assert job["next_run_at"] is not None
+
         paused = pause_job(job["id"], reason="user paused")
+
         assert paused is not None
         assert paused["enabled"] is False
         assert paused["state"] == "paused"
         assert paused["paused_reason"] == "user paused"
+        assert paused["next_run_at"] is None
+        assert get_due_jobs() == []
 
-    def test_resume_reenables_job(self, tmp_cron_dir):
+    def test_resume_reenables_job_and_recomputes_next_run(self, tmp_cron_dir):
         job = create_job(prompt="Resume me", schedule="every 1h")
         pause_job(job["id"], reason="user paused")
         resumed = resume_job(job["id"])
@@ -344,6 +349,24 @@ class TestPauseResumeJob:
         assert resumed["state"] == "scheduled"
         assert resumed["paused_at"] is None
         assert resumed["paused_reason"] is None
+        assert resumed["next_run_at"] is not None
+
+    def test_legacy_paused_job_with_stale_next_run_is_not_due(self, tmp_cron_dir):
+        job = create_job(prompt="Legacy paused", schedule="every 1h")
+        stale_next_run = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+        job.update({
+            "enabled": False,
+            "state": "paused",
+            "paused_at": datetime.now(timezone.utc).isoformat(),
+            "paused_reason": "legacy record",
+            "next_run_at": stale_next_run,
+        })
+        save_jobs([job])
+
+        assert get_due_jobs() == []
+        fetched = get_job(job["id"])
+        assert fetched is not None
+        assert fetched["next_run_at"] == stale_next_run
 
 
 class TestResolveJobRef:

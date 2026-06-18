@@ -110,6 +110,8 @@ COMMAND_REGISTRY: list[CommandDef] = [
     CommandDef("subgoal", "Add or manage extra criteria on the active goal", "Session",
                args_hint="[text | remove N | clear]"),
     CommandDef("status", "Show session, model, token, and context info", "Session"),
+    CommandDef("routines", "Show cron and service routine status", "Info",
+               aliases=("routine",), args_hint="[--all] [--limit N]"),
     CommandDef("whoami", "Show your slash command access (admin / user)", "Info"),
     CommandDef("profile", "Show active profile name and home directory", "Info"),
     CommandDef("sethome", "Set this chat as the home channel", "Session",
@@ -124,7 +126,12 @@ COMMAND_REGISTRY: list[CommandDef] = [
     CommandDef("config", "Show current configuration", "Configuration",
                cli_only=True),
     CommandDef("model", "Switch model for this session", "Configuration",
-               args_hint="[model] [--provider name] [--global] [--refresh]"),
+               aliases=("provider",), args_hint="[model] [--provider name] [--global] [--refresh]"),
+    CommandDef("mode", "Switch Wei Qi / 7v assistant mode for this session", "Configuration",
+               aliases=("模式", "默认", "default", "论文", "研究", "mba", "顾问", "opus",
+                        "sonnet", "latest-sonnet", "最新sonnet",
+                        "播客", "创意", "整理", "中文润色", "润色", "省钱", "状态", "自动", "智能", "auto", "smart"),
+               args_hint="[默认|论文|研究|MBA|顾问|opus|sonnet|播客|创意|整理|中文润色|省钱|状态|自动]"),
     CommandDef("codex-runtime", "Toggle codex app-server runtime for OpenAI/Codex models",
                "Configuration", aliases=("codex_runtime",),
                args_hint="[auto|codex_app_server]"),
@@ -1042,7 +1049,7 @@ _SLACK_RESERVED_COMMANDS = frozenset({
 # would otherwise get, and the Telegram-parity test fails when a canonical
 # gets clamped ("reset" was unpinned for exactly that — /new keeps its
 # native slot, the alias spelling stays reachable via /hermes reset).
-_SLACK_PRIORITY_ALIASES = ("btw", "bg")
+_SLACK_PRIORITY_ALIASES = ("btw", "bg", "reset", "q")
 
 # Canonical commands intentionally NOT given a native Slack slash slot. Slack
 # caps apps at 50 slash commands and the registry is at that ceiling; rather
@@ -1053,8 +1060,10 @@ _SLACK_PRIORITY_ALIASES = ("btw", "bg")
 # the telegram-parity test reads it so an entry here is a deliberate
 # "Slack-via-/hermes" decision, not a silent clamp.
 #   - credits: the billing/top-up surface; reached via /hermes credits on Slack.
-#   - debug: the log/report upload surface; reached via /hermes debug on Slack.
-_SLACK_VIA_HERMES_ONLY = frozenset({"credits", "debug"})
+#   - debug/platform/update/version: lower-frequency operator/info surfaces kept
+#     reachable through /hermes so Slack's 50-command cap preserves the higher-
+#     frequency native commands and aliases.
+_SLACK_VIA_HERMES_ONLY = frozenset({"credits", "debug", "platform", "update", "version"})
 
 
 def _sanitize_slack_name(raw: str) -> str:
@@ -1098,6 +1107,8 @@ def slack_native_slashes() -> list[tuple[str, str, str]]:
     entries.append(("hermes", "Talk to Hermes or run a subcommand", "[subcommand] [args]"))
     seen.add("hermes")
 
+    priority_aliases = ("btw", "bg", "reset", "q")
+
     def _add(name: str, desc: str, hint: str) -> None:
         slack_name = _sanitize_slack_name(name)
         if not slack_name or slack_name in seen:
@@ -1113,7 +1124,7 @@ def slack_native_slashes() -> list[tuple[str, str, str]]:
         entries.append((slack_name, desc[:140], hint[:100]))
         seen.add(slack_name)
 
-    # Priority pass: pin high-value aliases (e.g. /btw, /bg, /reset) ahead of
+    # Priority pass: pin high-value aliases (e.g. /btw, /bg, /reset, /q) ahead of
     # everything except /hermes, so a new canonical command can never silently
     # clamp them off the 50-slash cap. Each alias borrows its parent command's
     # description and hint.

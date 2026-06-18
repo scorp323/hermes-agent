@@ -4128,6 +4128,13 @@ def cmd_status(args):
     show_status(args)
 
 
+def cmd_routines(args):
+    """Show operator-safe routine/cron/launchd status."""
+    from hermes_cli.routines import cmd_routines as _cmd_routines
+
+    _cmd_routines(args)
+
+
 def cmd_cron(args):
     """Cron job management."""
     from hermes_cli.cron import cron_command
@@ -11067,7 +11074,7 @@ _BUILTIN_SUBCOMMANDS = frozenset(
         "gui", "desktop", "kanban", "login", "logout", "logs", "lsp", "mcp", "memory", "migrate",
         "model", "pairing", "plugins", "portal", "postinstall", "profile", "proxy",
         "prompt-size",
-        "send", "sessions", "setup",
+        "routines", "send", "sessions", "setup",
         "skills", "slack", "status", "tools", "uninstall", "update",
         "version", "webhook", "whatsapp", "whatsapp-cloud", "chat", "secrets", "security",
         # Help-ish invocations — plugin commands not being listed in
@@ -11775,6 +11782,19 @@ def main():
     # status command  (parser built in hermes_cli/subcommands/status.py)
     # =========================================================================
     build_status_parser(subparsers, cmd_status=cmd_status)
+
+    # =========================================================================
+    # routines command
+    # =========================================================================
+    routines_parser = subparsers.add_parser(
+        "routines",
+        help="Show operator-safe cron/launchd routine status",
+        description="Summarize Hermes cron jobs and local service-manager routines without prompts, stdout, or secrets",
+    )
+    routines_parser.add_argument("--all", action="store_true", help="Include disabled cron jobs")
+    routines_parser.add_argument("--limit", type=int, default=12, help="Maximum jobs/services to show per section")
+    routines_parser.add_argument("--no-launchd", action="store_true", help="Skip macOS LaunchAgent scan")
+    routines_parser.set_defaults(func=cmd_routines)
 
     # =========================================================================
     # cron command  (parser built in hermes_cli/subcommands/cron.py)
