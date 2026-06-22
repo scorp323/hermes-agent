@@ -7,6 +7,8 @@ session-scoped when applied by the gateway; they must not mutate profile config.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
+from pathlib import Path
 import re
 from typing import Iterable
 
@@ -29,7 +31,10 @@ class WeiqiModePreset:
 
 OPUS_STATUS = "OPUS_ENABLED_CLAUDE_CODE_MAX_OPUS_SUBSCRIPTION_WITH_HERMES_TOOL_CALL_BRIDGE"
 SONNET_STATUS = "SONNET_ENABLED_CLAUDE_CODE_MAX_SONNET_SUBSCRIPTION_WITH_HERMES_TOOL_CALL_BRIDGE"
-CLAUDE_CODE_ACP_COMMAND = "/Users/neo/.hermes/bin/claude-code-print-acp"
+CLAUDE_CODE_ACP_COMMAND = os.environ.get(
+    "HERMES_CLAUDE_CODE_ACP_COMMAND",
+    str(Path.home() / ".hermes" / "bin" / "claude-code-print-acp"),
+)
 
 _PRESETS: dict[str, WeiqiModePreset] = {
     "default": WeiqiModePreset(

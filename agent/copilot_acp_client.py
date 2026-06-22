@@ -54,9 +54,19 @@ def _is_gh_copilot_deprecation_message(stderr_text: str) -> bool:
 
 
 def _resolve_command() -> str:
+    real_home = os.getenv("HERMES_REAL_HOME", "").strip()
+    candidate_homes = [Path(real_home)] if real_home else []
+    candidate_homes.append(Path.home())
+    bridge = ""
+    for home in candidate_homes:
+        profile_bridge = home / ".hermes" / "bin" / "claude-code-print-acp"
+        if profile_bridge.exists():
+            bridge = str(profile_bridge)
+            break
     return (
         os.getenv("HERMES_COPILOT_ACP_COMMAND", "").strip()
         or os.getenv("COPILOT_CLI_PATH", "").strip()
+        or bridge
         or "copilot"
     )
 
