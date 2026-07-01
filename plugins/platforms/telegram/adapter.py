@@ -586,6 +586,8 @@ class TelegramAdapter(BasePlatformAdapter):
         # Slash-confirm button state: confirm_id → session_key (for /reload-mcp
         # and any other slash-confirm prompts; see GatewayRunner._request_slash_confirm).
         self._slash_confirm_state: Dict[str, str] = {}
+        # Session-hygiene button state: decision_id → session_key.
+        self._session_hygiene_state: Dict[str, str] = {}
         # Clarify button state: clarify_id → session_key (for the clarify tool's
         # multiple-choice prompts; see GatewayRunner clarify_callback wiring).
         self._clarify_state: Dict[str, str] = {}
@@ -3521,6 +3523,50 @@ class TelegramAdapter(BasePlatformAdapter):
             logger.warning("[%s] send_slash_confirm failed: %s", self.name, e)
             return SendResult(success=False, error=str(e))
 
+    async def send_session_hygiene_suggestion(
+        self, chat_id: str, message: str, session_key: str,
+        decision_id: str, metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Render a two-button session-hygiene fresh-start suggestion."""
+        if not self._bot:
+            return SendResult(success=False, error="Not connected")
+
+        try:
+            preview = self.format_message(message if len(message) <= 3800 else message[:3800] + "...")
+            keyboard = InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("🆕 Start fresh", callback_data=f"sh:fresh:{decision_id}"),
+                    InlineKeyboardButton("↩️ Keep this session", callback_data=f"sh:keep:{decision_id}"),
+                ],
+            ])
+
+            thread_id = self._metadata_thread_id(metadata)
+            kwargs: Dict[str, Any] = {
+                "chat_id": int(chat_id),
+                "text": preview,
+                "parse_mode": ParseMode.MARKDOWN_V2,
+                "reply_markup": keyboard,
+                **self._link_preview_kwargs(),
+            }
+            reply_to_id = self._reply_to_message_id_for_send(None, metadata, reply_to_mode=self._reply_to_mode)
+            kwargs["reply_to_message_id"] = reply_to_id
+            kwargs.update(
+                self._thread_kwargs_for_send(
+                    chat_id,
+                    thread_id,
+                    metadata,
+                    reply_to_message_id=reply_to_id,
+                    reply_to_mode=self._reply_to_mode,
+                )
+            )
+
+            msg = await self._send_message_with_thread_fallback(**kwargs)
+            self._session_hygiene_state[decision_id] = session_key
+            return SendResult(success=True, message_id=str(msg.message_id))
+        except Exception as e:
+            logger.warning("[%s] send_session_hygiene_suggestion failed: %s", self.name, e)
+            return SendResult(success=False, error=str(e))
+
     async def send_clarify(
         self,
         chat_id: str,
@@ -4099,6 +4145,46 @@ class TelegramAdapter(BasePlatformAdapter):
                 query_thread_id=query_thread_id,
                 query_user_name=query_user_name,
             )
+            return
+
+        # --- Session-hygiene callbacks (sh:choice:decision_id) ---
+        if data.startswith("sh:"):
+            parts = data.split(":", 2)
+            if len(parts) != 3:
+                await query.answer(text="Invalid session-hygiene data.")
+                return
+            choice = parts[1]
+            decision_id = parts[2]
+            caller_id = str(getattr(query.from_user, "id", ""))
+            if not self._is_callback_user_authorized(
+                caller_id,
+                chat_id=query_chat_id,
+                chat_type=str(query_chat_type) if query_chat_type is not None else None,
+                thread_id=str(query_thread_id) if query_thread_id is not None else None,
+                user_name=query_user_name,
+            ):
+                await query.answer(text="⛔ You are not authorized to answer this prompt.")
+                return
+            session_key = self._session_hygiene_state.pop(decision_id, None)
+            if not session_key:
+                await query.answer(text="This prompt has already been resolved.")
+                return
+            runner = getattr(getattr(self, "_message_handler", None), "__self__", None)
+            resolver = getattr(runner, "_resolve_session_hygiene_decision", None)
+            if not callable(resolver):
+                await query.answer(text="Session-hygiene resolver unavailable.")
+                return
+            result_text = await resolver(decision_id=decision_id, session_key=session_key, choice=choice)
+            label = "🆕 Starting fresh" if choice == "fresh" else "↩️ Keeping this session"
+            await query.answer(text=label)
+            try:
+                await query.edit_message_text(
+                    text=self.format_message(result_text),
+                    parse_mode=ParseMode.MARKDOWN_V2,
+                    reply_markup=None,
+                )
+            except Exception:
+                pass
             return
 
         # --- Exec approval callbacks (ea:choice:id) ---

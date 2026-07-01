@@ -588,3 +588,50 @@ class TestTelegramApprovalCallback:
         query.answer.assert_called_once()
         query.edit_message_text.assert_called_once()
         assert (tmp_path / ".update_response").read_text() == "n"
+
+class TestTelegramSessionHygieneCallback:
+    @pytest.mark.asyncio
+    async def test_session_hygiene_button_resolves_and_replays(self):
+        adapter = _make_adapter()
+        adapter._session_hygiene_state["h1"] = "agent:main:telegram:private:12345"
+
+        class Runner:
+            def _is_user_authorized(self, source):
+                return True
+
+            async def _handle_message(self, event):
+                return None
+
+            async def _resolve_session_hygiene_decision(self, **kwargs):
+                self.kwargs = kwargs
+                return "✅ Starting fresh with handoff."
+
+        runner = Runner()
+        adapter._message_handler = runner._handle_message
+
+        query = AsyncMock()
+        query.data = "sh:fresh:h1"
+        query.from_user.id = "12345"
+        query.from_user.first_name = "Nathan"
+        query.message = MagicMock()
+        query.message.chat_id = 12345
+        query.message.chat.type = "private"
+        query.message.message_thread_id = None
+        query.edit_message_text = AsyncMock()
+
+        update = MagicMock()
+        update.callback_query = query
+        context = MagicMock()
+
+        with patch.dict(os.environ, {"TELEGRAM_ALLOWED_USERS": "*"}, clear=False):
+            await adapter._handle_callback_query(update, context)
+
+        assert runner.kwargs == {
+            "decision_id": "h1",
+            "session_key": "agent:main:telegram:private:12345",
+            "choice": "fresh",
+        }
+        query.answer.assert_called_once()
+        query.edit_message_text.assert_called_once()
+        assert "h1" not in adapter._session_hygiene_state
+

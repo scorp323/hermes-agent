@@ -122,20 +122,53 @@ def opus_delegate(
         return _err("mode must be 'perspective' or 'work'.")
 
     if mode == "work":
-        # Gate full read+write+shell. In gateway mode this surfaces to the
-        # originating chat (Telegram) and blocks on the reply. Fail closed.
+        # Gate full read+write+shell. In gateway mode this must use the
+        # gateway approval queue, not the CLI input() prompt: gateway agent
+        # worker threads have no stdin and no prompt_toolkit callback, so the
+        # direct prompt path denies immediately. Fail closed if no approval
+        # path is available.
         try:
-            from tools.approval import prompt_dangerous_approval
+            from tools.approval import (
+                _await_gateway_decision,
+                _gateway_notify_cbs,
+                _is_gateway_approval_context,
+                _lock,
+                get_current_session_key,
+                prompt_dangerous_approval,
+            )
             from tools.terminal_tool import _get_approval_callback
 
-            decision = prompt_dangerous_approval(
-                command=f"opus_delegate(mode=work) in {workdir}",
-                description=(
-                    f"Opus 4.8 will run with FULL file-edit + shell access in "
-                    f"{workdir}. Task: {str(task).strip()[:240]}"
-                ),
-                approval_callback=_get_approval_callback(),
+            command = f"opus_delegate(mode=work) in {workdir}"
+            description = (
+                f"Opus 4.8 will run with FULL file-edit + shell access in "
+                f"{workdir}. Task: {str(task).strip()[:240]}"
             )
+            if _is_gateway_approval_context():
+                session_key = get_current_session_key()
+                with _lock:
+                    notify_cb = _gateway_notify_cbs.get(session_key)
+                if notify_cb is None:
+                    return _err("work-mode approval unavailable in gateway context; denied for safety")
+                decision_info = _await_gateway_decision(
+                    session_key,
+                    notify_cb,
+                    {
+                        "command": command,
+                        "pattern_key": "opus_delegate_work_mode",
+                        "pattern_keys": ["opus_delegate_work_mode"],
+                        "description": description,
+                        "allow_permanent": False,
+                    },
+                    surface="opus_delegate",
+                )
+                decision = decision_info.get("choice") if decision_info.get("resolved") else "deny"
+            else:
+                decision = prompt_dangerous_approval(
+                    command=command,
+                    description=description,
+                    allow_permanent=False,
+                    approval_callback=_get_approval_callback(),
+                )
         except Exception as exc:  # no approval path -> deny, never run unapproved
             return _err(f"work-mode approval unavailable; denied for safety: {exc}")
         if decision == "deny":

@@ -68,6 +68,340 @@ _PLATFORM_CONNECT_TIMEOUT_SECS_DEFAULT = 30.0
 _ADAPTER_DISCONNECT_TIMEOUT_SECS_DEFAULT = 5.0
 _TELEGRAM_COMMAND_MENTION_RE = re.compile(r"(?<![\w:/])/([A-Za-z0-9][A-Za-z0-9_-]*)")
 
+_SESSION_HYGIENE_CONTINUATION_RE = re.compile(
+    r"^\s*(also|actually|and|plus|continue|keep going|please proceed|proceed|"
+    r"great work|what'?s next|try again|you got stuck|please do so|i approve|"
+    r"proceed please|i just|it seems|if there is any|below are|i recorded|"
+    r"build all this|help me remove|yes|yep|ok|okay|no|wait|"
+    r"that|this|same|the above|what about|how about|additionally|one more|"
+    r"再|继续|还有|另外|对|不是|等等|那个|这个)\b",
+    re.IGNORECASE,
+)
+_SESSION_HYGIENE_DONE_RE = re.compile(
+    r"\b(done|created|added|updated|saved|scheduled|completed|verified|fixed|"
+    r"finished|sent|exported|generated|built)\b|已(完成|添加|创建|更新|保存|发送|修复)",
+    re.IGNORECASE,
+)
+_SESSION_HYGIENE_EVIDENCE_RE = re.compile(
+    r"(MEDIA:/\S+|https?://\S+|~?/[^\s`'\")]+|\b(?:pytest|tests?|verified|passed|"
+    r"status|log|diff|screenshot|job id|pid|http\s+\d{3}|sha256|commit|file|path)\b)",
+    re.IGNORECASE,
+)
+_SESSION_HYGIENE_PENDING_RE = re.compile(
+    r"\b(should i|do you want|which|need approval|requires approval|waiting for|"
+    r"blocked|pending|confirm|choose|pick)\b|请(确认|选择)|需要.*确认",
+    re.IGNORECASE,
+)
+
+
+def _session_hygiene_dict(config_data: Optional[dict]) -> dict:
+    if not isinstance(config_data, dict):
+        return {}
+    cfg = config_data.get("session_hygiene")
+    return cfg if isinstance(cfg, dict) else {}
+
+
+def _cfg_bool(block: dict, key: str, default: bool = False) -> bool:
+    value = block.get(key) if isinstance(block, dict) else None
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"true", "1", "yes", "on"}:
+            return True
+        if lowered in {"false", "0", "no", "off"}:
+            return False
+    return bool(value)
+
+
+def _cfg_int(block: dict, key: str, default: int) -> int:
+    value = block.get(key) if isinstance(block, dict) else None
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _session_hygiene_enabled(config_data: Optional[dict]) -> bool:
+    return _cfg_bool(_session_hygiene_dict(config_data), "enabled", False)
+
+
+def _session_hygiene_mode(config_data: Optional[dict]) -> str:
+    cfg = _session_hygiene_dict(config_data)
+    mode = str(cfg.get("mode", "suggest") if isinstance(cfg, dict) else "suggest").strip().lower()
+    if mode in {"false", "disabled", "disable", "none"}:
+        return "off"
+    if mode in {"true", "on", "enabled"}:
+        return "suggest"
+    if mode not in {"off", "suggest", "auto"}:
+        return "suggest"
+    return mode
+
+
+def _session_hygiene_auto_fresh_cfg(config_data: Optional[dict]) -> dict:
+    cfg = _session_hygiene_dict(config_data)
+    auto = cfg.get("auto_fresh") if isinstance(cfg, dict) else None
+    return auto if isinstance(auto, dict) else {}
+
+
+def _session_hygiene_suggest_cfg(config_data: Optional[dict]) -> dict:
+    cfg = _session_hygiene_dict(config_data)
+    suggest = cfg.get("suggest") if isinstance(cfg, dict) else None
+    return suggest if isinstance(suggest, dict) else {}
+
+
+def _session_hygiene_budget_cfg(config_data: Optional[dict]) -> dict:
+    cfg = _session_hygiene_dict(config_data)
+    budget = cfg.get("budget_backstop") if isinstance(cfg, dict) else None
+    return budget if isinstance(budget, dict) else {}
+
+
+def _datetime_age_seconds(dt: Any) -> Optional[float]:
+    if dt is None:
+        return None
+    try:
+        now = datetime.now(dt.tzinfo) if getattr(dt, "tzinfo", None) else datetime.now()
+        return max(0.0, (now - dt).total_seconds())
+    except Exception:
+        return None
+
+
+def _is_session_hygiene_continuation(event: Any, entry: Any, config_data: Optional[dict]) -> bool:
+    auto = _session_hygiene_auto_fresh_cfg(config_data)
+    if _cfg_bool(auto, "preserve_on_reply_to_bot", True) and getattr(event, "reply_to_message_id", None):
+        return True
+    text = str(getattr(event, "text", "") or "").strip()
+    if _cfg_bool(auto, "preserve_on_continuation_phrases", True) and _SESSION_HYGIENE_CONTINUATION_RE.search(text):
+        return True
+    grace_minutes = _cfg_int(auto, "grace_minutes", 5)
+    age = _datetime_age_seconds(getattr(entry, "fresh_start_armed_at", None))
+    if age is not None and grace_minutes > 0 and age <= grace_minutes * 60:
+        if _SESSION_HYGIENE_CONTINUATION_RE.search(text):
+            return True
+    return False
+
+
+def _should_auto_reset_for_session_hygiene(entry: Any, event: Any, config_data: Optional[dict]) -> bool:
+    if not _session_hygiene_enabled(config_data):
+        return False
+    if _session_hygiene_mode(config_data) != "auto":
+        return False
+    auto = _session_hygiene_auto_fresh_cfg(config_data)
+    if not _cfg_bool(auto, "enabled", False):
+        return False
+    if not getattr(entry, "fresh_start_armed", False):
+        return False
+    if getattr(entry, "resume_pending", False) or getattr(entry, "suspended", False):
+        return False
+    return not _is_session_hygiene_continuation(event, entry, config_data)
+
+
+_SESSION_HYGIENE_NEW_TASK_RE = re.compile(
+    r"\b(can you|could you|please|i want|i would like|i'd like|let'?s|help me|"
+    r"look through|research|build|create|set up|fix|check|diagnose|implement|"
+    r"review|analy[sz]e|find|make)\b",
+    re.IGNORECASE,
+)
+_SESSION_HYGIENE_WORD_RE = re.compile(r"[A-Za-z][A-Za-z0-9_-]{3,}|[\u4e00-\u9fff]{2,}")
+_SESSION_HYGIENE_STOPWORDS = {
+    "this", "that", "with", "from", "have", "what", "when", "where", "would",
+    "could", "should", "please", "work", "great", "done", "make", "help", "need",
+    "session", "hermes", "agent", "user", "latest", "previous", "current",
+}
+
+
+def _session_hygiene_terms(text: Any, limit: int = 80) -> set[str]:
+    terms: set[str] = set()
+    for match in _SESSION_HYGIENE_WORD_RE.findall(str(text or "").lower()):
+        if match in _SESSION_HYGIENE_STOPWORDS:
+            continue
+        terms.add(match)
+        if len(terms) >= limit:
+            break
+    return terms
+
+
+def _should_suggest_fresh_session_for_session_hygiene(entry: Any, event: Any, config_data: Optional[dict]) -> bool:
+    """Return True when the next user turn should be parked behind a fresh-session ask.
+
+    Compression handles context pressure; this predicate only handles task-boundary
+    ergonomics after a verified completion handoff has been armed.
+    """
+    if not _session_hygiene_enabled(config_data):
+        return False
+    if _session_hygiene_mode(config_data) != "suggest":
+        return False
+    if not getattr(entry, "fresh_start_armed", False):
+        return False
+    if getattr(entry, "resume_pending", False) or getattr(entry, "suspended", False):
+        return False
+    handoff = str(getattr(entry, "fresh_start_summary", "") or "").strip()
+    if not handoff:
+        return False
+    if _is_session_hygiene_continuation(event, entry, config_data):
+        return False
+    if callable(getattr(event, "get_command", None)) and event.get_command():
+        return False
+    text = str(getattr(event, "text", "") or "").strip()
+    suggest = _session_hygiene_suggest_cfg(config_data)
+    min_chars = _cfg_int(suggest, "min_new_task_chars", 24)
+    if len(text) < max(1, min_chars):
+        return False
+    if not _SESSION_HYGIENE_NEW_TASK_RE.search(text):
+        return False
+    overlap = _session_hygiene_terms(text) & _session_hygiene_terms(handoff)
+    max_overlap = _cfg_int(suggest, "max_topic_overlap_terms", 1)
+    if len(overlap) > max(0, max_overlap):
+        return False
+    return True
+
+
+def _extract_current_turn_tool_names(messages: list) -> list[str]:
+    names: list[str] = []
+    for msg in messages or []:
+        if not isinstance(msg, dict):
+            continue
+        tool_name = msg.get("tool_name")
+        if isinstance(tool_name, str) and tool_name:
+            names.append(tool_name)
+        tool_calls = msg.get("tool_calls")
+        if isinstance(tool_calls, str):
+            try:
+                tool_calls = json.loads(tool_calls)
+            except Exception:
+                tool_calls = None
+        if isinstance(tool_calls, list):
+            for call in tool_calls:
+                if not isinstance(call, dict):
+                    continue
+                fn_obj = call.get("function")
+                fn = fn_obj if isinstance(fn_obj, dict) else {}
+                name = fn.get("name") or call.get("name")
+                if isinstance(name, str) and name:
+                    names.append(name)
+    return names
+
+
+def _session_hygiene_arm_reason(
+    response: str,
+    agent_result: dict,
+    current_turn_messages: list,
+    config_data: Optional[dict],
+) -> Optional[str]:
+    if not _session_hygiene_enabled(config_data):
+        return None
+    if _session_hygiene_mode(config_data) == "off":
+        return None
+    response = str(response or "")
+    if not response.strip():
+        return None
+    if agent_result.get("failed") or agent_result.get("interrupted") or agent_result.get("partial"):
+        return None
+    if _SESSION_HYGIENE_PENDING_RE.search(response):
+        return None
+    tool_names = _extract_current_turn_tool_names(current_turn_messages)
+    if not tool_names:
+        return None
+    if not _SESSION_HYGIENE_DONE_RE.search(response):
+        return None
+    evidence_text = "\n".join(
+        str(msg.get("content", ""))
+        for msg in (current_turn_messages or [])
+        if isinstance(msg, dict) and msg.get("role") == "tool"
+    )
+    if not _SESSION_HYGIENE_EVIDENCE_RE.search(response + "\n" + evidence_text):
+        return None
+    return "task_completed:evidence"
+
+
+def _clip_handoff_text(value: Any, limit: int = 700) -> str:
+    text = " ".join(str(value or "").split())
+    if len(text) <= limit:
+        return text
+    return text[: max(0, limit - 1)].rstrip() + "…"
+
+
+def _extract_last_turn_content(messages: list, role: str) -> str:
+    for msg in reversed(messages or []):
+        if not isinstance(msg, dict) or msg.get("role") != role:
+            continue
+        content = msg.get("content")
+        if isinstance(content, str) and content.strip():
+            return content.strip()
+    return ""
+
+
+_HANDOFF_HANDLE_RE = re.compile(
+    r"(MEDIA:/\S+|https?://\S+|~?/[^\s`'\")]+|[A-Za-z0-9_.-]+/[A-Za-z0-9_./-]+)",
+)
+
+
+def _extract_handoff_handles(*texts: str, limit: int = 8) -> list[str]:
+    seen: set[str] = set()
+    handles: list[str] = []
+    for text in texts:
+        for match in _HANDOFF_HANDLE_RE.findall(str(text or "")):
+            handle = match.rstrip(".,;)]")
+            if len(handle) < 4 or handle in seen:
+                continue
+            seen.add(handle)
+            handles.append(handle)
+            if len(handles) >= limit:
+                return handles
+    return handles
+
+
+def _build_session_hygiene_handoff_packet(
+    response: str,
+    agent_result: dict,
+    current_turn_messages: list,
+    reason: str,
+    previous_session_id: Optional[str] = None,
+) -> str:
+    """Build a deterministic continuation packet for a fresh session.
+
+    This intentionally avoids a second LLM call: the handoff exists because the
+    current context is already expensive/fragile. Treat the packet as an
+    operator checklist, not a transcript summary.
+    """
+    last_user = _extract_last_turn_content(current_turn_messages, "user")
+    tool_names = list(dict.fromkeys(_extract_current_turn_tool_names(current_turn_messages)))
+    handles = _extract_handoff_handles(last_user, response)
+    blocked = "none detected mechanically"
+    if _SESSION_HYGIENE_PENDING_RE.search(str(response or "")):
+        blocked = "assistant response appears to contain a pending question/approval gate; preserve that gate"
+    usage_bits: list[str] = []
+    for key, label in (
+        ("input_tokens", "input"),
+        ("output_tokens", "output"),
+        ("api_calls", "api calls"),
+    ):
+        value = agent_result.get(key)
+        if value not in (None, "", 0):
+            usage_bits.append(f"{label}: {value}")
+    usage = ", ".join(usage_bits) or "not reported"
+    tools = ", ".join(tool_names[:20]) if tool_names else "none detected in final turn"
+    artifacts = "\n".join(f"  - `{h}`" for h in handles) if handles else "  - none detected mechanically"
+    previous_line = f"- Previous session id: `{previous_session_id}`\n" if previous_session_id else "- Previous session id: not captured\n"
+    return (
+        "## Session Handoff\n"
+        f"{previous_line}"
+        f"- Objective: Continue safely after an approved fresh-session handoff. Latest user turn: {_clip_handoff_text(last_user or 'not captured', 500)}\n"
+        f"- Current state: Previous turn completed and returned this final assistant output: {_clip_handoff_text(response, 900)}\n"
+        "- Decisions locked: Preserve any explicit approvals, denials, or boundaries already stated in the prior session; do not infer missing approval.\n"
+        "- Files/artifacts touched:\n"
+        f"{artifacts}\n"
+        f"- Commands/tests already run: Tool calls used in the final turn: {tools}. Detailed outputs remain in the prior session transcript.\n"
+        f"- Verification evidence: {usage}. Treat self-reported completion as unverified unless a concrete artifact/status/test handle is listed above.\n"
+        "- Open risks: Mechanical handoff may omit earlier transcript details; use session_search/read-back if a claim matters.\n"
+        f"- Blocked/gated items: {blocked}.\n"
+        "- Next exact action: Read the user's new message, use this packet as reference-only context, and continue from the safest verified state; if needed, inspect the old session or artifacts before acting."
+    )
+
 _TELEGRAM_NOISY_STATUS_RE = re.compile(
     r"("  # transient/auxiliary status that should stay in logs, not Telegram chat
     r"auxiliary\s+.+\s+failed"
@@ -1543,6 +1877,12 @@ if _config_path.exists():
                 os.environ["HERMES_AGENT_TIMEOUT"] = str(_agent_cfg["gateway_timeout"])
             if "gateway_timeout_warning" in _agent_cfg:
                 os.environ["HERMES_AGENT_TIMEOUT_WARNING"] = str(_agent_cfg["gateway_timeout_warning"])
+            if "gateway_wall_timeout" in _agent_cfg:
+                os.environ["HERMES_AGENT_WALL_TIMEOUT"] = str(_agent_cfg["gateway_wall_timeout"])
+            if "gateway_wall_timeout_groups_only" in _agent_cfg:
+                os.environ["HERMES_AGENT_WALL_TIMEOUT_GROUPS_ONLY"] = str(
+                    _agent_cfg["gateway_wall_timeout_groups_only"]
+                ).lower()
             if "gateway_notify_interval" in _agent_cfg:
                 os.environ["HERMES_AGENT_NOTIFY_INTERVAL"] = str(_agent_cfg["gateway_notify_interval"])
             if "restart_drain_timeout" in _agent_cfg:
@@ -2573,6 +2913,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # /new and /reset.  /model and other mid-session operations
         # preserve the queue.
         self._queued_events: Dict[str, List[MessageEvent]] = {}
+        # Session hygiene fresh-start suggestions park exactly one triggering
+        # user event while Nathan chooses Start fresh vs Keep.  Keyed by
+        # decision id and by session key for callback/text resolution.
+        self._session_hygiene_pending: Dict[str, Dict[str, Any]] = {}
+        self._session_hygiene_pending_by_session: Dict[str, str] = {}
+        self._session_hygiene_asked_sessions: set[str] = set()
         self._pending_native_image_paths_by_session: Dict[str, List[str]] = {}
         self._busy_ack_ts: Dict[str, float] = {}  # last busy-ack timestamp per session (debounce)
         self._session_run_generation: Dict[str, int] = {}
@@ -7329,6 +7675,36 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Otherwise control/session commands like /new or /help get silently
         # consumed as update answers instead of being dispatched normally.
         _quick_key = self._session_key_for_source(source)
+
+        # Session-hygiene suggestions park the triggering user message until the
+        # user chooses Start fresh or Keep. If another normal message arrives
+        # before a choice, default to KEEP and process FIFO in the old session:
+        # run the parked message now and queue the new arrival for the next turn.
+        _hygiene_pending_id = getattr(self, "_session_hygiene_pending_by_session", {}).get(_quick_key)
+        if _hygiene_pending_id and not getattr(event, "_session_hygiene_bypass_suggest", False):
+            _pending_cmd = event.get_command()
+            if _pending_cmd not in {"session-hygiene", "session_hygiene", "fresh", "keep"}:
+                _pending = getattr(self, "_session_hygiene_pending", {}).pop(_hygiene_pending_id, None)
+                getattr(self, "_session_hygiene_pending_by_session", {}).pop(_quick_key, None)
+                if _pending and _pending.get("event") is not None:
+                    try:
+                        self.session_store.clear_fresh_start(_quick_key)
+                    except Exception:
+                        logger.debug("Failed to clear session-hygiene marker during implicit keep", exc_info=True)
+                    _current_event = event
+                    _parked_event = _pending["event"]
+                    try:
+                        setattr(_current_event, "_session_hygiene_bypass_suggest", True)
+                        setattr(_parked_event, "_session_hygiene_bypass_suggest", True)
+                    except Exception:
+                        pass
+                    _adapter = self.adapters.get(source.platform)
+                    if _adapter is not None:
+                        self._enqueue_fifo(_quick_key, _current_event, _adapter)
+                    event = _parked_event
+                    source = event.source
+                    _quick_key = self._session_key_for_source(source)
+
         _update_prompts = getattr(self, "_update_prompt_pending", {})
         if _update_prompts.get(_quick_key):
             raw = (event.text or "").strip()
@@ -7604,6 +7980,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # doesn't think an agent is still active.
                 return await self._handle_reset_command(event)
 
+            if _cmd_def_inner and _cmd_def_inner.name == "handoff":
+                await self._interrupt_and_clear_session(
+                    _quick_key,
+                    source,
+                    interrupt_reason=_INTERRUPT_REASON_RESET,
+                    invalidation_reason="handoff_command",
+                )
+                return await self._handle_handoff_command(event)
+
             # /queue <prompt> — queue without interrupting.
             # Semantics: each /queue invocation produces its own full agent
             # turn, processed in FIFO order after the current run (and any
@@ -7695,6 +8080,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # /agents (/tasks alias) should be query-only and never interrupt.
             if _cmd_def_inner and _cmd_def_inner.name == "agents":
                 return await self._handle_agents_command(event)
+
+            if _cmd_def_inner and _cmd_def_inner.name == "session-hygiene":
+                return await self._handle_session_hygiene_command(event)
 
             # /background must bypass the running-agent guard — it starts a
             # parallel task and must never interrupt the active conversation.
@@ -8135,6 +8523,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if canonical == "compress":
             return await self._handle_compress_command(event)
 
+        if canonical == "session-hygiene":
+            return await self._handle_session_hygiene_command(event)
+
         if canonical == "usage":
             return await self._handle_usage_command(event)
 
@@ -8179,6 +8570,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         if canonical == "branch":
             return await self._handle_branch_command(event)
+
+        if canonical == "handoff":
+            return await self._handle_handoff_command(event)
 
         if canonical == "rollback":
             return await self._handle_rollback_command(event)
@@ -8858,6 +9252,58 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     self._record_telegram_topic_binding(source, session_entry)
                 except Exception:
                     logger.debug("Failed to record Telegram topic binding", exc_info=True)
+
+        _hygiene_config_data = _load_gateway_config()
+        _hygiene_reset_reason = None
+        if await self._maybe_offer_session_hygiene_suggestion(
+            event=event,
+            session_key=session_key,
+            session_entry=session_entry,
+            config_data=_hygiene_config_data,
+        ):
+            return ""
+        if _should_auto_reset_for_session_hygiene(session_entry, event, _hygiene_config_data):
+            old_session_id = session_entry.session_id
+            old_reason = getattr(session_entry, "fresh_start_reason", None) or "session_hygiene"
+            old_handoff = getattr(session_entry, "fresh_start_summary", None)
+            new_entry = self.session_store.reset_session(
+                session_key,
+                handoff_context=old_handoff,
+            )
+            if new_entry is not None:
+                session_entry = new_entry
+                _hygiene_reset_reason = old_reason
+                self._evict_cached_agent(session_key)
+                self._session_model_overrides.pop(session_key, None)
+                self._session_weiqi_mode_overrides.pop(session_key, None)
+                self._session_weiqi_manual_locks.pop(session_key, None)
+                self._set_session_reasoning_override(session_key, None)
+                if hasattr(self, "_pending_model_notes"):
+                    self._pending_model_notes.pop(session_key, None)
+                if self._is_telegram_topic_lane(source):
+                    self._sync_telegram_topic_binding(
+                        source, session_entry, reason="session-hygiene-fresh-start",
+                    )
+                try:
+                    adapter = self.adapters.get(source.platform)
+                    if adapter:
+                        await adapter.send(
+                            source.chat_id,
+                            "↪️ Started a fresh Hermes session due to context pressure. Prior-session handoff is loaded and ready to continue.",
+                            metadata=self._thread_metadata_for_source(source),
+                        )
+                except Exception as exc:
+                    logger.debug("Session hygiene fresh-start notice failed: %s", exc)
+                logger.info(
+                    "Session hygiene auto-reset: key=%s old_session=%s new_session=%s reason=%s handoff=%s",
+                    session_key, old_session_id, session_entry.session_id, old_reason, bool(old_handoff),
+                )
+        elif getattr(session_entry, "fresh_start_armed", False) and _session_hygiene_enabled(_hygiene_config_data):
+            # The new inbound message looks like a continuation/reply; keep the
+            # transcript for this turn and let post-turn hygiene re-arm if the
+            # continuation completes cleanly.
+            self.session_store.clear_fresh_start(session_key)
+
         if getattr(session_entry, "was_auto_reset", False):
             # Treat auto-reset as a full conversation boundary — drop every
             # session-scoped transient state so the fresh session does not
@@ -8916,6 +9362,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         # Build the context prompt to inject
         context_prompt = build_session_context_prompt(context, redact_pii=_redact_pii)
+
+        if _hygiene_reset_reason:
+            if getattr(session_entry, "handoff_context", None):
+                _hygiene_note_tail = (
+                    "The prior session's handoff packet is loaded below as reference-only context; "
+                    "use it instead of assuming the full prior transcript is available."
+                )
+            else:
+                _hygiene_note_tail = (
+                    "Do not assume prior conversation context is available unless the user repeats it."
+                )
+            context_prompt = (
+                "[System note: Session hygiene started a fresh session before this message "
+                f"because the previous session was marked '{_hygiene_reset_reason}'. "
+                f"{_hygiene_note_tail}]"
+                "\n\n"
+                + context_prompt
+            )
         
         # If the previous session expired and was auto-reset, prepend a notice
         # so the agent knows this is a fresh conversation (not an intentional /reset).
@@ -9955,6 +10419,33 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 session_entry.session_key,
                 last_prompt_tokens=agent_result.get("last_prompt_tokens", 0),
             )
+
+            _hygiene_reason = _session_hygiene_arm_reason(
+                response,
+                agent_result,
+                locals().get("new_messages", []),
+                _hygiene_config_data,
+            )
+            if _hygiene_reason and session_key:
+                try:
+                    _handoff_packet = _build_session_hygiene_handoff_packet(
+                        response,
+                        agent_result,
+                        locals().get("new_messages", []),
+                        _hygiene_reason,
+                        previous_session_id=session_entry.session_id,
+                    )
+                    self.session_store.arm_fresh_start(
+                        session_key,
+                        _hygiene_reason,
+                        summary=_handoff_packet,
+                    )
+                    logger.info(
+                        "Session hygiene armed: key=%s session=%s reason=%s",
+                        session_key, session_entry.session_id, _hygiene_reason,
+                    )
+                except Exception:
+                    logger.debug("Failed to arm session hygiene fresh-start", exc_info=True)
 
             # Intentional silence is a delivery decision, not a transcript
             # mutation.  The agent's [SILENT]/NO_REPLY assistant turn above is
@@ -12076,6 +12567,223 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return t("gateway.reload_mcp.failed", error=e)
 
 
+
+    # ------------------------------------------------------------------
+    # Session-hygiene suggestion controls
+    # ------------------------------------------------------------------
+
+    def _pop_session_hygiene_pending(
+        self,
+        *,
+        decision_id: Optional[str] = None,
+        session_key: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        pending_by_id = getattr(self, "_session_hygiene_pending", {})
+        pending_by_session = getattr(self, "_session_hygiene_pending_by_session", {})
+        if decision_id is None and session_key is not None:
+            decision_id = pending_by_session.get(session_key)
+        if not decision_id:
+            return None
+        item = pending_by_id.pop(decision_id, None)
+        if item:
+            pending_by_session.pop(str(item.get("session_key") or ""), None)
+        return item
+
+    async def _maybe_offer_session_hygiene_suggestion(
+        self,
+        *,
+        event: MessageEvent,
+        session_key: str,
+        session_entry: Any,
+        config_data: Optional[dict],
+    ) -> bool:
+        """Park ``event`` and ask whether to start fresh. Returns True if parked."""
+        if getattr(event, "_session_hygiene_bypass_suggest", False):
+            return False
+        if not _should_suggest_fresh_session_for_session_hygiene(session_entry, event, config_data):
+            return False
+        old_session_id = str(getattr(session_entry, "session_id", "") or "")
+        if old_session_id and old_session_id in getattr(self, "_session_hygiene_asked_sessions", set()):
+            return False
+        if getattr(self, "_session_hygiene_pending_by_session", {}).get(session_key):
+            return True
+
+        counter = getattr(self, "_slash_confirm_counter", None)
+        if counter is None:
+            import itertools as _itertools
+            counter = _itertools.count(1)
+            self._slash_confirm_counter = counter
+        decision_id = f"h{next(counter)}"
+        handoff = str(getattr(session_entry, "fresh_start_summary", "") or "")
+        self._session_hygiene_pending[decision_id] = {
+            "decision_id": decision_id,
+            "session_key": session_key,
+            "event": event,
+            "handoff": handoff,
+            "old_session_id": old_session_id,
+            "created_at": time.time(),
+        }
+        self._session_hygiene_pending_by_session[session_key] = decision_id
+
+        message = (
+            "🧭 **Session hygiene check**\n\n"
+            "This looks like a new task, and this chat is carrying old task context. "
+            "Start a fresh Hermes session with a handoff from the previous session?\n\n"
+            "Choose **Start fresh** to load the handoff into a new session, or "
+            "**Keep this session** to continue here."
+        )
+        adapter = self.adapters.get(event.source.platform)
+        metadata = self._thread_metadata_for_source(event.source, self._reply_anchor_for_event(event))
+        sent = False
+        if adapter is not None and hasattr(adapter, "send_session_hygiene_suggestion"):
+            try:
+                result = await adapter.send_session_hygiene_suggestion(
+                    chat_id=event.source.chat_id,
+                    message=message,
+                    session_key=session_key,
+                    decision_id=decision_id,
+                    metadata=metadata,
+                )
+                sent = bool(result and getattr(result, "success", False))
+            except Exception as exc:
+                logger.debug("Session hygiene button send failed: %s", exc, exc_info=True)
+        if not sent and adapter is not None:
+            result = await adapter.send(
+                event.source.chat_id,
+                message + "\n\nText fallback: reply `/fresh` or `/keep`.",
+                metadata=metadata,
+            )
+            sent = bool(result and getattr(result, "success", False))
+        if not sent:
+            self._pop_session_hygiene_pending(decision_id=decision_id)
+            logger.warning(
+                "Session hygiene suggestion could not be delivered; processing normally: key=%s decision=%s",
+                session_key, decision_id,
+            )
+            return False
+        if old_session_id:
+            self._session_hygiene_asked_sessions.add(old_session_id)
+            if len(self._session_hygiene_asked_sessions) > 2048:
+                self._session_hygiene_asked_sessions = set(list(self._session_hygiene_asked_sessions)[-1024:])
+        logger.info(
+            "Session hygiene suggestion parked event: key=%s old_session=%s decision=%s",
+            session_key, old_session_id, decision_id,
+        )
+        return True
+
+    async def _resolve_session_hygiene_decision(
+        self,
+        *,
+        decision_id: Optional[str] = None,
+        session_key: Optional[str] = None,
+        choice: str,
+        query_user: Optional[str] = None,
+    ) -> str:
+        choice = "fresh" if str(choice).lower() in {"fresh", "start", "once", "approve"} else "keep"
+        pending = self._pop_session_hygiene_pending(decision_id=decision_id, session_key=session_key)
+        if not pending:
+            return "This session-hygiene prompt was already resolved or expired."
+        event = pending.get("event")
+        if event is None:
+            return "Session-hygiene prompt had no parked message; nothing to replay."
+        session_key = str(pending.get("session_key") or session_key or self._session_key_for_source(event.source))
+        handoff = str(pending.get("handoff") or "")
+        old_session_id = str(pending.get("old_session_id") or "")
+        try:
+            setattr(event, "_session_hygiene_bypass_suggest", True)
+        except Exception:
+            pass
+
+        if choice == "fresh":
+            new_entry = self.session_store.reset_session(session_key, handoff_context=handoff)
+            if new_entry is not None:
+                self._evict_cached_agent(session_key)
+                self._session_model_overrides.pop(session_key, None)
+                self._session_weiqi_mode_overrides.pop(session_key, None)
+                self._session_weiqi_manual_locks.pop(session_key, None)
+                self._set_session_reasoning_override(session_key, None)
+                if hasattr(self, "_pending_model_notes"):
+                    self._pending_model_notes.pop(session_key, None)
+                if self._is_telegram_topic_lane(event.source):
+                    self._sync_telegram_topic_binding(
+                        event.source, new_entry, reason="session-hygiene-approved-fresh-start",
+                    )
+                action_text = f"✅ Starting fresh with handoff. Previous session: `{old_session_id or 'unknown'}`."
+            else:
+                self.session_store.clear_fresh_start(session_key)
+                action_text = "⚠️ Could not create a fresh session; keeping this session and replaying the message."
+        else:
+            self.session_store.clear_fresh_start(session_key)
+            action_text = "✅ Keeping this session. Replaying the parked message here."
+
+        adapter = self.adapters.get(event.source.platform)
+        if adapter is not None:
+            await adapter.handle_message(event)
+        return action_text
+
+    async def _handle_session_hygiene_command(self, event: MessageEvent) -> Optional[str]:
+        source = event.source
+        session_key = self._session_key_for_source(source)
+        raw_command = event.get_command() or "session-hygiene"
+        arg = (event.get_command_args() or "").strip().lower()
+        action = arg.split()[0] if arg else "status"
+        if raw_command == "fresh":
+            action = "fresh"
+        elif raw_command == "keep":
+            action = "keep"
+
+        if action in {"keep", "cancel", "stay"}:
+            if getattr(self, "_session_hygiene_pending_by_session", {}).get(session_key):
+                return await self._resolve_session_hygiene_decision(session_key=session_key, choice="keep")
+            cleared = self.session_store.clear_fresh_start(session_key)
+            return "✅ Session hygiene kept here; pending fresh-start suggestion cleared." if cleared else "No pending session-hygiene suggestion for this chat."
+
+        if action in {"fresh", "start"}:
+            if getattr(self, "_session_hygiene_pending_by_session", {}).get(session_key):
+                return await self._resolve_session_hygiene_decision(session_key=session_key, choice="fresh")
+            if session_key in getattr(self, "_running_agents", {}):
+                return "A turn is already running in this chat; use `/queue /session-hygiene fresh` or wait for it to finish before starting fresh."
+            entry = self.session_store.get_or_create_session(source)
+            old_session_id = getattr(entry, "session_id", "")
+            handoff = getattr(entry, "fresh_start_summary", None) or (
+                "## Session Handoff\n"
+                f"- Previous session id: `{old_session_id or 'unknown'}`\n"
+                "- Objective: Manual fresh session requested by the user.\n"
+                "- Current state: No verified mechanical handoff packet was pending.\n"
+                "- Decisions locked: Preserve explicit approvals/boundaries from the prior session; do not infer missing approval.\n"
+                "- Files/artifacts touched:\n  - none detected mechanically\n"
+                "- Commands/tests already run: not captured mechanically\n"
+                "- Verification evidence: not captured mechanically\n"
+                "- Open risks: Use session_search/read-back if prior details matter.\n"
+                "- Blocked/gated items: none detected mechanically.\n"
+                "- Next exact action: Read the user's next real message and proceed from the safest verified state."
+            )
+            new_entry = self.session_store.reset_session(session_key, handoff_context=handoff)
+            if new_entry is None:
+                return "⚠️ Could not create a fresh session."
+            self._evict_cached_agent(session_key)
+            if self._is_telegram_topic_lane(source):
+                self._sync_telegram_topic_binding(source, new_entry, reason="session-hygiene-manual-fresh")
+            return f"✅ Started fresh with handoff. Previous session: `{old_session_id or 'unknown'}`."
+
+        entry = self.session_store.get_or_create_session(source)
+        cfg = _load_gateway_config()
+        pending_id = getattr(self, "_session_hygiene_pending_by_session", {}).get(session_key)
+        mode = _session_hygiene_mode(cfg)
+        lines = [
+            "## Session hygiene",
+            f"- Mode: `{mode}`",
+            f"- Current session: `{getattr(entry, 'session_id', '')}`",
+            f"- Suggestion armed: `{bool(getattr(entry, 'fresh_start_armed', False))}`",
+            f"- Pending user decision: `{bool(pending_id)}`",
+        ]
+        reason = getattr(entry, "fresh_start_reason", None)
+        if reason:
+            lines.append(f"- Reason: `{reason}`")
+        if getattr(entry, "fresh_start_summary", None):
+            lines.append("- Handoff packet: `ready`")
+        lines.append("- Commands: `/session-hygiene keep`, `/session-hygiene fresh`, `/session-hygiene status`")
+        return "\n".join(lines)
 
     # ------------------------------------------------------------------
     # Slash-command confirmation primitive (generic)
@@ -15335,9 +16043,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     await asyncio.sleep(1)
         
         # We need to share the agent instance for interrupt support
-        agent_holder = [None]  # Mutable container for the agent instance
-        result_holder = [None]  # Mutable container for the result
-        tools_holder = [None]   # Mutable container for the tool definitions
+        agent_holder: list[Any | None] = [None]
+        result_holder: list[Optional[Dict[str, Any]]] = [None]
+        tools_holder: list[Any | None] = [None]
         stream_consumer_holder = [None]  # Mutable container for stream consumer
         
         # Bridge sync step_callback → async hooks.emit for agent:step events
@@ -16652,11 +17360,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _notify_task = asyncio.create_task(_notify_long_running())
 
         try:
-            # Run in thread pool to not block.  Use an *inactivity*-based
-            # timeout instead of a wall-clock limit: the agent can run for
-            # hours if it's actively calling tools / receiving stream tokens,
-            # but a hung API call or stuck tool with no activity for the
-            # configured duration is caught and killed.  (#4815)
+            # Run in thread pool to not block.  Use an inactivity timeout for
+            # true hangs, plus an optional wall-clock watchdog for group chats
+            # where a slow-but-active local stream can keep resetting activity
+            # while the user-facing chat remains stuck.
             #
             # Config: agent.gateway_timeout in config.yaml, or
             # HERMES_AGENT_TIMEOUT env var (env var takes precedence).
@@ -16665,12 +17372,31 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _agent_timeout = _agent_timeout_raw if _agent_timeout_raw > 0 else None
             _agent_warning_raw = _float_env("HERMES_AGENT_TIMEOUT_WARNING", 900)
             _agent_warning = _agent_warning_raw if _agent_warning_raw > 0 else None
+            _wall_limit_raw = _float_env("HERMES_AGENT_WALL_TIMEOUT", 900)
+            _wall_limit = _wall_limit_raw if _wall_limit_raw > 0 else None
+            _wall_groups_only = os.getenv(
+                "HERMES_AGENT_WALL_TIMEOUT_GROUPS_ONLY", "true"
+            ).strip().lower() not in {"0", "false", "no", "off"}
+            _chat_type = str(getattr(source, "chat_type", "") or "").lower()
+            _chat_id_str = str(getattr(source, "chat_id", "") or "")
+            _is_group_like = (
+                _chat_type in {"group", "supergroup", "channel"}
+                or _chat_id_str.startswith("-")
+            )
+            _wall_applies = bool(
+                _wall_limit is not None and (not _wall_groups_only or _is_group_like)
+            )
+            _turn_started_at = (
+                float(self._running_agents_ts.get(session_key, time.time()))
+                if session_key else time.time()
+            )
             _warning_fired = False
             _executor_task = asyncio.ensure_future(
                 self._run_in_executor_with_context(run_sync)
             )
 
             _inactivity_timeout = False
+            _wall_clock_timeout = False
             _POLL_INTERVAL = 5.0
 
             if _agent_timeout is None:
@@ -16683,6 +17409,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
                     if done:
                         response = _executor_task.result()
+                        break
+                    if (
+                        _wall_applies
+                        and _wall_limit is not None
+                        and (time.time() - _turn_started_at) >= _wall_limit
+                    ):
+                        _wall_clock_timeout = True
                         break
                     # Backup interrupt check: if the monitor task died or
                     # missed the interrupt, catch it here.
@@ -16723,6 +17456,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             _idle_secs = _act.get("seconds_since_activity", 0.0)
                         except Exception:
                             pass
+                    # Wall-clock watchdog catches slow-but-active local streams
+                    # that keep resetting the inactivity timer while the chat
+                    # remains unusable.
+                    if (
+                        _wall_applies
+                        and _wall_limit is not None
+                        and (time.time() - _turn_started_at) >= _wall_limit
+                    ):
+                        _wall_clock_timeout = True
+                        break
                     # Staged warning: fire once before escalating to full timeout.
                     if (not _warning_fired and _agent_warning is not None
                             and _idle_secs >= _agent_warning):
@@ -16763,7 +17506,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             _backup_agent.interrupt(_bp_text)
                             _interrupt_detected.set()
 
-            if _inactivity_timeout:
+            if _inactivity_timeout or _wall_clock_timeout:
                 # Build a diagnostic summary from the agent's activity tracker.
                 _timed_out_agent = agent_holder[0]
                 _activity = {}
@@ -16778,12 +17521,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _cur_tool = _activity.get("current_tool")
                 _iter_n = _activity.get("api_call_count", 0)
                 _iter_max = _activity.get("max_iterations", 0)
+                _wall_elapsed = max(0.0, time.time() - _turn_started_at)
+                _timeout_kind = "wall-clock" if _wall_clock_timeout else "inactivity"
+                _timeout_limit = _wall_limit if _wall_clock_timeout else _agent_timeout
 
                 logger.error(
-                    "Agent idle for %.0fs (timeout %.0fs) in session %s "
-                    "| last_activity=%s | iteration=%s/%s | tool=%s",
-                    _secs_ago, _agent_timeout, session_key,
-                    _last_desc, _iter_n, _iter_max,
+                    "Agent %s timeout after %.0fs (limit %.0fs) in session %s "
+                    "| idle=%.0fs | last_activity=%s | iteration=%s/%s | tool=%s",
+                    _timeout_kind,
+                    _wall_elapsed if _wall_clock_timeout else _secs_ago,
+                    _timeout_limit or 0,
+                    session_key,
+                    _secs_ago,
+                    _last_desc,
+                    _iter_n,
+                    _iter_max,
                     _cur_tool or "none",
                 )
 
@@ -16792,13 +17544,37 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if _timed_out_agent and hasattr(_timed_out_agent, "interrupt"):
                     _timed_out_agent.interrupt(_INTERRUPT_REASON_TIMEOUT)
 
-                _timeout_mins = int(_agent_timeout // 60) or 1
+                _timeout_seconds = float(_timeout_limit or 0)
+                _timeout_mins = int(_timeout_seconds // 60) or 1
+
+                if _wall_clock_timeout and session_key:
+                    try:
+                        self.session_store.arm_fresh_start(
+                            session_key,
+                            "turn_watchdog:wall_timeout",
+                            summary=(
+                                f"Previous group turn exceeded {_timeout_mins} min wall-clock "
+                                "limit and was interrupted."
+                            ),
+                        )
+                    except Exception:
+                        logger.debug("Failed to arm fresh start after wall timeout", exc_info=True)
 
                 # Construct a user-facing message with diagnostic context.
-                _diag_lines = [
-                    f"⏱️ Agent inactive for {_timeout_mins} min — no tool calls "
-                    f"or API responses."
-                ]
+                if _wall_clock_timeout:
+                    _diag_lines = [
+                        f"⏱️ Agent exceeded the {_timeout_mins} min wall-clock limit "
+                        "for this group turn."
+                    ]
+                    _diag_lines.append(
+                        "I interrupted it and marked the next message for a fresh context "
+                        "so this chat does not stay stuck on a slow local fallback."
+                    )
+                else:
+                    _diag_lines = [
+                        f"⏱️ Agent inactive for {_timeout_mins} min — no tool calls "
+                        f"or API responses."
+                    ]
                 if _cur_tool:
                     _diag_lines.append(
                         f"The agent appears stuck on tool `{_cur_tool}` "
@@ -16811,8 +17587,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         f"iteration {_iter_n}/{_iter_max}). "
                         "The agent may have been waiting on an API response."
                     )
+                _limit_key = (
+                    "agent.gateway_wall_timeout"
+                    if _wall_clock_timeout else "agent.gateway_timeout"
+                )
                 _diag_lines.append(
-                    "To increase the limit, set agent.gateway_timeout in config.yaml "
+                    f"To increase the limit, set {_limit_key} in config.yaml "
                     "(value in seconds, 0 = no limit) and restart the gateway.\n"
                     "Try again, or use /reset to start fresh."
                 )
@@ -16824,7 +17604,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "tools": tools_holder[0] or [],
                     "history_offset": 0,
                     "failed": True,
+                    "error": _timeout_kind,
                 }
+                result_holder[0] = response
 
             # Track fallback model state: if the agent switched to a
             # fallback model during this run, persist it so /model shows
@@ -16846,6 +17628,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             # Check if we were interrupted OR have a queued message (/queue).
             result = result_holder[0]
+            if result is None:
+                result = response if isinstance(response, dict) else {
+                    "final_response": response or "",
+                    "messages": [],
+                    "api_calls": 0,
+                    "tools": tools_holder[0] or [],
+                    "history_offset": 0,
+                    "failed": False,
+                }
+                result_holder[0] = result
             adapter = self.adapters.get(source.platform)
             
             # Get pending message from adapter.

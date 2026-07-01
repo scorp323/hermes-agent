@@ -234,6 +234,143 @@ def _append_subdir_hint_to_multimodal(value: Dict[str, Any], hint: str) -> None:
         value["text_summary"] = value["text_summary"] + hint
 
 
+def _image_payload_chars_from_part(part: Any) -> int:
+    """Return inline image payload length for an OpenAI-style content part."""
+    if not isinstance(part, dict):
+        return 0
+    if part.get("type") not in {"image_url", "input_image"}:
+        return 0
+    image_value = part.get("image_url")
+    if isinstance(image_value, dict):
+        url = image_value.get("url", "")
+    else:
+        url = image_value if isinstance(image_value, str) else ""
+    if isinstance(url, str) and url.startswith("data:image/"):
+        return len(url)
+    return 0
+
+
+def _strip_image_parts_from_tool_message(msg: Dict[str, Any], *, reason: str) -> bool:
+    """Replace a tool message's inline image parts with text placeholders."""
+    content = msg.get("content")
+    if not isinstance(content, list):
+        return False
+    had_image = False
+    text_parts: List[str] = []
+    for part in content:
+        if isinstance(part, str):
+            if part.strip():
+                text_parts.append(part.strip())
+            continue
+        if not isinstance(part, dict):
+            continue
+        ptype = part.get("type")
+        if ptype in {"image_url", "input_image"}:
+            had_image = True
+            continue
+        if ptype in {"text", "input_text"}:
+            text = str(part.get("text") or "").strip()
+            if text:
+                text_parts.append(text)
+    if not had_image:
+        return False
+    placeholder = f"[image content omitted from future context: {reason}]"
+    if text_parts:
+        msg["content"] = "\n\n".join(text_parts + [placeholder])
+    else:
+        msg["content"] = placeholder
+    return True
+
+
+def prune_stale_tool_image_messages(
+    messages: List[Dict[str, Any]],
+    *,
+    keep_last: int = 0,
+    max_total_image_chars: int = 600_000,
+) -> tuple[int, int]:
+    """Evict stale inline image payloads from live tool-result history.
+
+    Native vision tool results are useful for the next model call, but if their
+    base64 image parts remain in ``messages`` they are re-sent on every later
+    call and can overwhelm the context window. Keep the newest pending image
+    result and strip older tool images to compact text placeholders.
+
+    ``keep_last`` is an emergency escape hatch for callers that want to retain
+    additional non-pending image messages under ``max_total_image_chars``. The
+    default is intentionally zero: stale native media should not survive in the
+    live prompt once the model has already had a chance to inspect it.
+    """
+    if not isinstance(messages, list) or not messages:
+        return 0, 0
+
+    candidates: List[tuple[int, int]] = []
+    for idx, msg in enumerate(messages):
+        if not isinstance(msg, dict) or msg.get("role") != "tool":
+            continue
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        payload = sum(_image_payload_chars_from_part(part) for part in content)
+        if payload > 0:
+            candidates.append((idx, payload))
+
+    if not candidates:
+        return 0, 0
+
+    # Protect every image in the currently pending tool-result block: the
+    # suffix immediately following the last assistant-with-tool-calls, when that
+    # suffix contains only tool messages. If an assistant response or user turn
+    # has happened since, the image is stale and should be stripped.  A single
+    # assistant turn can issue multiple vision tool calls in parallel; the model
+    # has not seen *any* of that pending suffix yet, so protecting only the
+    # newest image would silently drop earlier requested images before first use.
+    pending_tool_start: Optional[int] = None
+    for idx in range(len(messages) - 1, -1, -1):
+        msg = messages[idx]
+        if isinstance(msg, dict) and msg.get("role") == "assistant" and msg.get("tool_calls"):
+            pending_tool_start = idx + 1
+            break
+    protected_tail_idxs: set[int] = set()
+    if pending_tool_start is not None and pending_tool_start < len(messages):
+        suffix = messages[pending_tool_start:]
+        if suffix and all(isinstance(m, dict) and m.get("role") == "tool" for m in suffix):
+            protected_tail_idxs = {idx for idx, _payload in candidates if idx >= pending_tool_start}
+
+    keep: set[int] = set()
+    total_kept = 0
+    candidate_payloads = dict(candidates)
+    for idx in protected_tail_idxs:
+        keep.add(idx)
+        total_kept += candidate_payloads.get(idx, 0)
+
+    for idx, payload in reversed(candidates):
+        if idx in keep:
+            continue
+        if len(keep) < max(0, keep_last) and total_kept + payload <= max_total_image_chars:
+            keep.add(idx)
+            total_kept += payload
+
+    stripped = 0
+    removed_chars = 0
+    for idx, payload in candidates:
+        if idx in keep:
+            continue
+        if _strip_image_parts_from_tool_message(
+            messages[idx],
+            reason="stale native vision payload evicted to keep the session under budget",
+        ):
+            stripped += 1
+            removed_chars += payload
+
+    if stripped:
+        logger.info(
+            "Pruned %d stale tool image message(s), removed %.1f MB of inline media",
+            stripped,
+            removed_chars / (1024 * 1024),
+        )
+    return stripped, removed_chars
+
+
 def _extract_file_mutation_targets(tool_name: str, args: Dict[str, Any]) -> List[str]:
     """Return the file paths a ``write_file`` or ``patch`` call is targeting.
 

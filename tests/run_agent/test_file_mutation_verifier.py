@@ -166,6 +166,38 @@ class TestRecordFileMutationResult:
         )
         assert agent._turn_failed_file_mutations == {}
 
+    def test_success_removes_prior_failure_with_equivalent_path_spelling(self):
+        agent = _bare_agent()
+        abs_path = "/Users/neo/.hermes/profiles/travel/scripts/travel_confirmed_trip_prep_watchdog.py"
+        home_path = "~/.hermes/profiles/travel/scripts/travel_confirmed_trip_prep_watchdog.py"
+        # First attempt fails with an absolute path extracted from a V4A patch body.
+        agent._record_file_mutation_result(
+            "patch",
+            {
+                "mode": "patch",
+                "patch": (
+                    "*** Begin Patch\n"
+                    f"*** Update File: {abs_path}\n"
+                    "@@ ctx @@\n-old\n+new\n"
+                    "*** End Patch\n"
+                ),
+            },
+            json.dumps({"error": "hunk not found"}),
+            is_error=True,
+        )
+        canonical_path = "~/.hermes/profiles/travel/scripts/travel_confirmed_trip_prep_watchdog.py"
+        assert canonical_path in agent._turn_failed_file_mutations
+
+        # Recovery succeeds via the same file addressed with ~/.  The verifier
+        # must clear the previous failure instead of surfacing a false footer.
+        agent._record_file_mutation_result(
+            "patch",
+            {"mode": "replace", "path": home_path, "old_string": "real", "new_string": "fixed"},
+            json.dumps({"success": True, "diff": "--- a/x\n+++ b/x\n"}),
+            is_error=False,
+        )
+        assert agent._turn_failed_file_mutations == {}
+
     def test_write_file_with_lint_error_counts_as_landed(self):
         agent = _bare_agent()
         agent._record_file_mutation_result(

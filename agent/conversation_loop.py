@@ -57,6 +57,7 @@ from agent.process_bootstrap import _install_safe_stdio
 from agent.prompt_caching import apply_anthropic_cache_control
 from agent.retry_utils import jittered_backoff
 from agent.trajectory import has_incomplete_scratchpad
+from agent.tool_dispatch_helpers import prune_stale_tool_image_messages
 from agent.usage_pricing import estimate_usage_cost, normalize_usage
 from hermes_constants import PARTIAL_STREAM_STUB_ID
 from hermes_logging import set_session_context
@@ -735,6 +736,23 @@ def run_conversation(
                 agent.session_id or "-",
             )
 
+        # Native vision tool results carry base64 image data in live tool
+        # messages so the model can inspect pixels on the next call.  Once
+        # those image-bearing tool messages become stale, keeping the raw data
+        # in ``messages`` re-sends it on every later API request and can balloon
+        # the prompt into the million-token range.  Mutate the canonical live
+        # history here (not just the API copy) so compression/fallback/retry
+        # cannot keep rehydrating stale media payloads.
+        _pruned_images, _pruned_chars = prune_stale_tool_image_messages(messages)
+        if _pruned_images:
+            request_logger.info(
+                "Pruned %s stale native-vision tool image message(s) before request "
+                "(removed %.1f MB, session=%s)",
+                _pruned_images,
+                _pruned_chars / (1024 * 1024),
+                agent.session_id or "-",
+            )
+
         api_messages = []
         for idx, msg in enumerate(messages):
             api_msg = msg.copy()
@@ -885,6 +903,11 @@ def run_conversation(
         approx_request_tokens = estimate_request_tokens_rough(
             api_messages, tools=agent.tools or None
         )
+        # Expose the post-sanitization request size to fallback activation so
+        # oversized local fallbacks can be refused before cold-starting local
+        # inference services. This is advisory only; API-reported usage remains
+        # the authoritative billing/token source after a successful call.
+        agent._last_estimated_prompt_tokens = approx_request_tokens
 
         _runtime_context_error = _ollama_context_limit_error(
             agent, approx_request_tokens

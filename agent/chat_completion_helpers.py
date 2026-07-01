@@ -163,6 +163,118 @@ def _maybe_autostart_local_fallback(provider: str, model: str, base_url: str | N
         )
 
 
+def _local_fallback_max_prompt_tokens() -> int:
+    """Return the max request size allowed for local fallback entries.
+
+    Local models are useful as cheap/private fallbacks, but routing a giant
+    gateway transcript to them can make chat platforms appear stuck for many
+    minutes. ``0`` disables the guard. The env var exists for emergency
+    operator overrides; config.yaml is the normal control plane.
+    """
+
+    raw: Any = os.getenv("HERMES_LOCAL_FALLBACK_MAX_PROMPT_TOKENS")
+    if raw in (None, ""):
+        raw = 90_000
+        try:
+            from hermes_cli.config import load_config
+
+            cfg = load_config() or {}
+            fallback_cfg = cfg.get("fallback") or {}
+            if isinstance(fallback_cfg, dict):
+                if "local_max_prompt_tokens" in fallback_cfg:
+                    raw = fallback_cfg.get("local_max_prompt_tokens")
+                else:
+                    local_cfg = fallback_cfg.get("local") or {}
+                    if isinstance(local_cfg, dict) and "max_prompt_tokens" in local_cfg:
+                        raw = local_cfg.get("max_prompt_tokens")
+        except Exception:
+            raw = 90_000
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return 90_000
+
+
+def _is_local_fallback_candidate(
+    provider: str,
+    model: str,
+    base_url: str | None = None,
+) -> bool:
+    """Return True for fallback entries backed by local/private inference.
+
+    Prefer explicit provider/model labels, then safe URL parsing. Avoid broad
+    substring checks on arbitrary URLs so remote services such as ollama.com do
+    not get misclassified as local.
+    """
+
+    provider_norm = (provider or "").strip().lower()
+    model_norm = (model or "").strip().lower()
+    if (provider_norm, model_norm) in _LOCAL_FALLBACK_LAUNCHD_LABELS:
+        return True
+    if provider_norm in {
+        "ollama-local",
+        "lmstudio",
+        "lm-studio",
+        "llama-cpp",
+        "llamacpp",
+        "litellm-qwen",
+    }:
+        return True
+    if provider_norm.endswith("-local") or provider_norm.startswith("local-"):
+        return True
+    if base_url and is_local_endpoint(base_url):
+        return True
+    return False
+
+
+def _fallback_request_tokens(agent) -> int:
+    """Best available estimate of the request that triggered fallback."""
+
+    for attr in ("_last_estimated_prompt_tokens", "_last_request_tokens"):
+        try:
+            value = int(getattr(agent, attr, 0) or 0)
+            if value > 0:
+                return value
+        except (TypeError, ValueError):
+            pass
+    try:
+        ctx = getattr(agent, "context_compressor", None)
+        value = int(getattr(ctx, "last_prompt_tokens", 0) or 0)
+        if value > 0:
+            return value
+    except (TypeError, ValueError):
+        pass
+    try:
+        value = int(getattr(agent, "session_prompt_tokens", 0) or 0)
+        if value > 0:
+            return value
+    except (TypeError, ValueError):
+        pass
+    return 0
+
+
+def _should_skip_local_fallback_for_context(
+    agent,
+    provider: str,
+    model: str,
+    base_url: str | None = None,
+) -> tuple[bool, int, int]:
+    """Gate local fallbacks for huge requests.
+
+    Returns ``(skip, request_tokens, limit)``. Unknown token counts do not skip:
+    the guard is intentionally conservative and only prevents known-oversized
+    local requests.
+    """
+
+    limit = _local_fallback_max_prompt_tokens()
+    if limit <= 0:
+        return False, 0, limit
+    if not _is_local_fallback_candidate(provider, model, base_url):
+        return False, 0, limit
+    tokens = _fallback_request_tokens(agent)
+    return bool(tokens and tokens >= limit), tokens, limit
+
+
 def _ra():
     """Lazy ``run_agent`` reference.
 
@@ -1252,6 +1364,27 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         )
         return agent._try_activate_fallback()
 
+    skip_local, request_tokens, local_limit = _should_skip_local_fallback_for_context(
+        agent, fb_provider, fb_model, fb_base_url_for_dedup or None,
+    )
+    if skip_local:
+        logger.warning(
+            "Fallback skip: local fallback %s/%s refused for oversized request "
+            "(~%s tokens >= limit %s)",
+            fb_provider,
+            fb_model,
+            f"{request_tokens:,}",
+            f"{local_limit:,}",
+        )
+        try:
+            agent._emit_status(
+                "⚠️ Skipping local fallback: current context is too large "
+                f"(~{request_tokens:,} tokens; local limit {local_limit:,})."
+            )
+        except Exception:
+            pass
+        return agent._try_activate_fallback()
+
     # Use centralized router for client construction.
     # raw_codex=True because the main agent needs direct responses.stream()
     # access for Codex providers.
@@ -1445,7 +1578,11 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         # answering, so "what model are you?" doesn't report the primary.
         rewrite_prompt_model_identity(agent, fb_model, fb_provider)
 
-        agent._buffer_status(
+        # Fallback activation is a material model change, not transient retry
+        # noise. Emit it immediately so gateway users know when a turn is being
+        # answered by a fallback model even if that fallback succeeds and the
+        # retry-status buffer is later cleared.
+        agent._emit_status(
             f"🔄 Primary model failed — switching to fallback: "
             f"{fb_model} via {fb_provider}"
         )

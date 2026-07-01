@@ -139,3 +139,47 @@ async def test_new_command_only_clears_own_session():
     assert other_key in runner._session_reasoning_overrides
     assert session_key not in runner._pending_model_notes
     assert other_key in runner._pending_model_notes
+
+
+@pytest.mark.asyncio
+async def test_handoff_command_resets_with_injected_context():
+    """Gateway /handoff must create a fresh session carrying a reference packet."""
+    runner = _make_runner()
+    source = _make_source()
+    session_key = build_session_key(source)
+    old_entry = runner.session_store._entries[session_key]
+    old_entry.session_id = "old-session"
+    new_entry = SessionEntry(
+        session_key=session_key,
+        session_id="new-session",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        handoff_context="placeholder",
+    )
+    runner.session_store.get_or_create_session.return_value = old_entry
+    runner.session_store.load_transcript.return_value = [
+        {"role": "user", "content": "Build Lucky reading companion."},
+        {"role": "assistant", "content": "Done — tests passed."},
+    ]
+
+    def _reset(_key, handoff_context=None, **_kw):
+        new_entry.handoff_context = handoff_context
+        runner.session_store._entries[session_key] = new_entry
+        return new_entry
+
+    runner.session_store.reset_session.side_effect = _reset
+    runner._session_db = MagicMock()
+
+    result = await runner._handle_handoff_command(
+        MessageEvent(text="/handoff continue Lucky tracker", source=source, message_id="m2")
+    )
+
+    assert "Handoff ready" in str(result)
+    assert "old-session" in str(result)
+    assert "new-session" in str(result)
+    runner.session_store.reset_session.assert_called_once()
+    assert "## Session Handoff" in new_entry.handoff_context
+    assert "continue Lucky tracker" in new_entry.handoff_context
+    assert "Build Lucky reading companion" in new_entry.handoff_context

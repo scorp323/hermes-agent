@@ -316,16 +316,15 @@ def _image_to_base64_data_url(image_path: Path, mime_type: Optional[str] = None)
 # provider accepts the image and we reject outright.
 _MAX_BASE64_BYTES = 20 * 1024 * 1024
 
-# Proactive embed cap (4 MB).  This is the size we resize an image DOWN to
-# before embedding it into conversation history, regardless of the 20 MB hard
-# ceiling.  Anthropic's per-image base64 limit is 5 MB; once an oversized image
-# is baked into history (e.g. a vision tool-result), it is re-sent on every
-# subsequent turn and permanently wedges the session with a 400 that retries
-# can't clear (the bad bytes are immutable history).  Capping at embed time —
-# with headroom under 5 MB — is the only durable fix.  Matches the post-failure
-# shrink target in agent.conversation_compression so behaviour is consistent
-# whether we resize proactively or reactively.
-_EMBED_TARGET_BYTES = 4 * 1024 * 1024
+# Proactive embed cap (512 KiB).  This is the size we resize an image DOWN to
+# before embedding it into live conversation history, regardless of the 20 MB
+# hard ceiling.  Provider per-image byte ceilings are much higher (Anthropic's
+# is 5 MB), but the live agent re-sends tool-result image data on every
+# subsequent model call. A few multi-megabyte contact sheets can therefore turn
+# into a million-token request even when each image is provider-valid. Keep the
+# native fast path small; callers that need full-fidelity media should preserve
+# the file path and analyze/write compact observations to disk.
+_EMBED_TARGET_BYTES = 512 * 1024
 
 # Proactive embed dimension cap (px, longest side).  Anthropic enforces an
 # 8000px per-side ceiling INDEPENDENTLY of the 5 MB byte cap — a tall full-page
@@ -754,8 +753,9 @@ async def _vision_analyze_native(
         # 400, and because history is immutable, an oversized embed
         # permanently wedges the session — retries can't clear bytes (or
         # pixels) that are already in the request.  Resize DOWN to the embed
-        # target (4 MB / 7900px, headroom under both ceilings) whenever the
-        # payload exceeds either limit, not just at the 20 MB hard ceiling.
+        # target (512 KiB / 7900px, headroom under both provider ceilings
+        # and live-context pressure) whenever the payload exceeds either
+        # limit, not just at the 20 MB hard ceiling.
         _over_bytes = len(image_data_url) > _EMBED_TARGET_BYTES
         _over_dims = _image_exceeds_dimension(temp_image_path, _EMBED_MAX_DIMENSION)
         if _over_bytes or _over_dims:

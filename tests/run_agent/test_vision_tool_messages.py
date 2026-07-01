@@ -15,6 +15,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from agent.tool_dispatch_helpers import prune_stale_tool_image_messages
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -173,6 +175,89 @@ class TestToolResultContentProactiveDowngrade:
 
         assert isinstance(content, str)
         assert "cached downgrade" in content
+
+
+class TestToolImagePruning:
+    def _tool_image_msg(self, payload: str, text: str = "image loaded"):
+        return {
+            "role": "tool",
+            "name": "vision_analyze",
+            "tool_call_id": "call_x",
+            "content": [
+                {"type": "text", "text": text},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64," + payload}},
+            ],
+        }
+
+    def test_prunes_stale_tool_image_after_assistant_response(self):
+        messages = [
+            {"role": "user", "content": "look"},
+            {"role": "assistant", "tool_calls": [{"id": "call_x", "function": {"name": "vision_analyze", "arguments": "{}"}}]},
+            self._tool_image_msg("A" * 1000),
+            {"role": "assistant", "content": "I saw it."},
+        ]
+
+        stripped, removed = prune_stale_tool_image_messages(messages)
+
+        assert stripped == 1
+        assert removed > 1000
+        assert isinstance(messages[2]["content"], str)
+        assert "image loaded" in messages[2]["content"]
+        assert "image content omitted" in messages[2]["content"]
+
+    def test_preserves_tail_tool_image_for_immediate_next_model_call(self):
+        messages = [
+            {"role": "user", "content": "look"},
+            {"role": "assistant", "tool_calls": [{"id": "call_x", "function": {"name": "vision_analyze", "arguments": "{}"}}]},
+            self._tool_image_msg("B" * 1000),
+        ]
+
+        stripped, removed = prune_stale_tool_image_messages(messages)
+
+        assert (stripped, removed) == (0, 0)
+        assert isinstance(messages[-1]["content"], list)
+        assert any(
+            part.get("type") == "image_url"
+            for part in messages[-1]["content"]
+            if isinstance(part, dict)
+        )
+
+    def test_preserves_all_pending_tool_images_from_same_assistant_turn(self):
+        first = self._tool_image_msg("A" * 500_000, text="first")
+        second = self._tool_image_msg("B" * 500_000, text="second")
+        messages = [
+            {"role": "user", "content": "compare these"},
+            {"role": "assistant", "tool_calls": [
+                {"id": "first", "function": {"name": "vision_analyze", "arguments": "{}"}},
+                {"id": "second", "function": {"name": "vision_analyze", "arguments": "{}"}},
+            ]},
+            first,
+            second,
+        ]
+
+        stripped, removed = prune_stale_tool_image_messages(messages, max_total_image_chars=600_000)
+
+        assert (stripped, removed) == (0, 0)
+        assert isinstance(first["content"], list)
+        assert isinstance(second["content"], list)
+
+    def test_prunes_stale_image_even_when_new_pending_image_exists(self):
+        old = self._tool_image_msg("A" * 500_000, text="old")
+        new = self._tool_image_msg("B" * 500_000, text="new")
+        messages = [
+            {"role": "user", "content": "look"},
+            {"role": "assistant", "tool_calls": [{"id": "old", "function": {"name": "vision_analyze", "arguments": "{}"}}]},
+            old,
+            {"role": "assistant", "tool_calls": [{"id": "new", "function": {"name": "vision_analyze", "arguments": "{}"}}]},
+            new,
+        ]
+
+        stripped, removed = prune_stale_tool_image_messages(messages, max_total_image_chars=600_000)
+
+        assert stripped == 1
+        assert removed > 500_000
+        assert isinstance(old["content"], str)
+        assert isinstance(new["content"], list)
 
 
 # ---------------------------------------------------------------------------

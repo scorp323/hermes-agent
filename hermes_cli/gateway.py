@@ -5,6 +5,7 @@ Handles: hermes gateway [run|start|stop|restart|status|install|uninstall|setup]
 """
 
 import asyncio
+import html
 import logging
 import os
 import shlex
@@ -3480,6 +3481,13 @@ def generate_launchd_plist() -> str:
         <key>HERMES_PROXY_WAIT_SECONDS</key>
         <string>180</string>"""
 
+    acp_env_xml = ""
+    for key in ("HERMES_COPILOT_ACP_COMMAND", "HERMES_COPILOT_ACP_ARGS"):
+        if key in os.environ:
+            acp_env_xml += f"""
+        <key>{key}</key>
+        <string>{html.escape(os.environ.get(key, ""), quote=True)}</string>"""
+
     return f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -3502,7 +3510,7 @@ def generate_launchd_plist() -> str:
         <key>VIRTUAL_ENV</key>
         <string>{venv_dir}</string>
         <key>HERMES_HOME</key>
-        <string>{hermes_home}</string>{proxy_env_xml}
+        <string>{hermes_home}</string>{proxy_env_xml}{acp_env_xml}
     </dict>
 
     <key>LimitLoadToSessionType</key>
@@ -3585,33 +3593,19 @@ def refresh_launchd_plist_if_needed() -> bool:
     except Exception:
         gateway_pid = None
 
-    if (
-        gateway_pid is not None
-        and _is_pid_ancestor_of_current_process(gateway_pid)
-        and hasattr(os, "setsid")  # POSIX-only; launchd is macOS so always true here
-    ):
-        # Delegate to a new session: `start_new_session=True` detaches the
-        # helper from the gateway's process group, so the bootout that kills
-        # the gateway (and us) does not kill the helper before it bootstraps.
-        reload_script = (
-            f"sleep 2; "
-            f"launchctl bootout {shlex.quote(target)} 2>/dev/null; "
-            f"sleep 1; "
-            f"launchctl bootstrap {shlex.quote(domain)} {shlex.quote(str(plist_path))} 2>/dev/null"
-        )
-        try:
-            subprocess.Popen(
-                ["/bin/bash", "-c", reload_script],
-                start_new_session=True,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-        except Exception as e:
-            logger.warning("Deferred launchd reload could not be spawned: %s", e)
-            return False
+    if gateway_pid is not None and _is_pid_ancestor_of_current_process(gateway_pid):
+        # Fail closed when the refresh is running inside the gateway's own
+        # launchd process tree (e.g. from a Telegram/Discord agent turn). A
+        # direct bootout kills the gateway and this CLI before a follow-up
+        # bootstrap is guaranteed to run; a detached helper can also fail
+        # silently and leave the service unloaded. Preserve availability:
+        # update the plist on disk, but require an external operator shell or
+        # a later natural restart to make launchd re-read it.
         print(
-            "↻ Updated gateway launchd service definition; reload deferred to a "
-            "detached helper (refresh ran inside the gateway process tree)"
+            "↻ Updated gateway launchd service definition on disk; live launchd "
+            "reload skipped because this command is running inside the gateway "
+            "process tree. Run `hermes gateway start` from an external shell to "
+            "reload without risking self-unload."
         )
         return True
 

@@ -258,8 +258,88 @@ class TestFallbackChainDedup:
         assert ok is True
         # The first entry was skipped — only the second reached resolve.
         assert called == [("zai", "glm-4.7")], (
-            f"expected fallback to skip same-state entry, got call order: {called}"
+            "same-provider/model fallback must be skipped before resolving"
         )
+
+
+class TestLocalFallbackContextGuard:
+    def test_skips_oversized_local_fallback_and_advances_chain(self):
+        fbs = [
+            {"provider": "litellm-qwen", "model": "qwen-core"},
+            {"provider": "zai", "model": "glm-4.7"},
+        ]
+        agent = _make_agent(fallback_model=fbs)
+        setattr(agent, "_last_estimated_prompt_tokens", 120_000)
+        called = []
+
+        def _resolve(provider, model=None, raw_codex=False, **kwargs):
+            called.append((provider, model))
+            return _mock_client(), model
+
+        with (
+            patch.dict(
+                "os.environ",
+                {"HERMES_LOCAL_FALLBACK_MAX_PROMPT_TOKENS": "90000"},
+                clear=False,
+            ),
+            patch("agent.chat_completion_helpers._maybe_autostart_local_fallback") as mock_autostart,
+            patch("agent.auxiliary_client.resolve_provider_client", side_effect=_resolve),
+            patch("hermes_cli.model_normalize.normalize_model_for_provider", side_effect=lambda m, p: m),
+        ):
+            assert agent._try_activate_fallback() is True
+
+        assert called == [("zai", "glm-4.7")]
+        assert ("litellm-qwen", "qwen-core", None) not in [
+            tuple(call.args) for call in mock_autostart.call_args_list
+        ]
+        assert getattr(agent, "provider") == "zai"
+        assert getattr(agent, "model") == "glm-4.7"
+
+    def test_local_fallback_allowed_under_limit(self):
+        fbs = [{"provider": "litellm-qwen", "model": "qwen-core"}]
+        agent = _make_agent(fallback_model=fbs)
+        setattr(agent, "_last_estimated_prompt_tokens", 40_000)
+
+        with (
+            patch.dict(
+                "os.environ",
+                {"HERMES_LOCAL_FALLBACK_MAX_PROMPT_TOKENS": "90000"},
+                clear=False,
+            ),
+            patch("agent.chat_completion_helpers._maybe_autostart_local_fallback") as mock_autostart,
+            patch(
+                "agent.auxiliary_client.resolve_provider_client",
+                return_value=(_mock_client(base_url="http://127.0.0.1:4000/v1"), "qwen-core"),
+            ),
+            patch("hermes_cli.model_normalize.normalize_model_for_provider", side_effect=lambda m, p: m),
+        ):
+            assert agent._try_activate_fallback() is True
+
+        mock_autostart.assert_called_once()
+        assert getattr(agent, "provider") == "litellm-qwen"
+        assert getattr(agent, "model") == "qwen-core"
+
+    def test_all_local_oversized_returns_false(self):
+        fbs = [
+            {"provider": "litellm-qwen", "model": "qwen-core"},
+            {"provider": "ollama-local", "model": "qwen3:32b"},
+        ]
+        agent = _make_agent(fallback_model=fbs)
+        setattr(agent, "_last_estimated_prompt_tokens", 120_000)
+
+        with (
+            patch.dict(
+                "os.environ",
+                {"HERMES_LOCAL_FALLBACK_MAX_PROMPT_TOKENS": "90000"},
+                clear=False,
+            ),
+            patch("agent.chat_completion_helpers._maybe_autostart_local_fallback") as mock_autostart,
+            patch("agent.auxiliary_client.resolve_provider_client") as mock_resolve,
+        ):
+            assert agent._try_activate_fallback() is False
+
+        mock_autostart.assert_not_called()
+        mock_resolve.assert_not_called()
 
     def test_skips_entry_matching_current_base_url_and_model(self):
         """Two custom_providers entries pointing at the same shim URL

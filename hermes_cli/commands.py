@@ -84,12 +84,16 @@ COMMAND_REGISTRY: list[CommandDef] = [
                args_hint="[N]"),
     CommandDef("title", "Set a title for the current session", "Session",
                args_hint="[name]"),
-    CommandDef("handoff", "Hand off this session to a messaging platform (Telegram, Discord, etc.)", "Session",
-               args_hint="<platform>", cli_only=True),
+    CommandDef("handoff", "CLI: send session to a platform; gateway: fresh session with handoff context", "Session",
+               args_hint="[platform|note]"),
     CommandDef("branch", "Branch the current session (explore a different path)", "Session",
                aliases=("fork",), args_hint="[name]"),
     CommandDef("compress", "Compress conversation context (add 'here [N]' to keep recent N turns)", "Session",
                args_hint="[here [N] | focus topic]"),
+    CommandDef("session-hygiene", "Inspect or resolve fresh-session handoff suggestions", "Session",
+               aliases=("session_hygiene", "fresh", "keep"),
+               args_hint="[status|keep|fresh]",
+               subcommands=("status", "keep", "fresh"), gateway_only=True),
     CommandDef("rollback", "List or restore filesystem checkpoints", "Session",
                args_hint="[number]"),
     CommandDef("snapshot", "Create or restore state snapshots of Hermes config/state", "Session",
@@ -362,11 +366,13 @@ ACTIVE_SESSION_BYPASS_COMMANDS: frozenset[str] = frozenset(
         "background",
         "commands",
         "deny",
+        "handoff",
         "help",
         "new",
         "profile",
         "queue",
         "restart",
+        "session-hygiene",
         "status",
         "steer",
         "stop",
@@ -1066,7 +1072,12 @@ _SLACK_PRIORITY_ALIASES = ("btw", "bg", "reset", "q")
 #   - debug/platform/update/version: lower-frequency operator/info surfaces kept
 #     reachable through /hermes so Slack's 50-command cap preserves the higher-
 #     frequency native commands and aliases.
-_SLACK_VIA_HERMES_ONLY = frozenset({"credits", "billing", "debug", "platform", "update", "version"})
+#   - usage/insights: analytics/info surfaces that remain reachable through
+#     /hermes on Slack when the native-slash cap is full.
+_SLACK_VIA_HERMES_ONLY = frozenset({
+    "credits", "billing", "debug", "platform", "update", "version",
+    "usage", "insights",
+})
 
 
 def _sanitize_slack_name(raw: str) -> str:

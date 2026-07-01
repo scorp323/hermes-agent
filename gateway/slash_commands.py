@@ -61,7 +61,12 @@ class GatewaySlashCommandsMixin:
         adapter = self.adapters.get(platform) if getattr(self, "adapters", None) else None
         return getattr(adapter, "typed_command_prefix", "/") if adapter is not None else "/"
 
-    async def _handle_reset_command(self, event: MessageEvent) -> Union[str, EphemeralReply]:
+    async def _handle_reset_command(
+        self,
+        event: MessageEvent,
+        handoff_context: str | None = None,
+        title_arg_override: str | None = None,
+    ) -> Union[str, EphemeralReply]:
         """Handle /new or /reset command."""
         source = event.source
         
@@ -111,7 +116,10 @@ class GatewaySlashCommandsMixin:
             pass
 
         # Reset the session
-        new_entry = self.session_store.reset_session(session_key)
+        new_entry = self.session_store.reset_session(
+            session_key,
+            handoff_context=handoff_context,
+        )
 
         # Clear any session-scoped model/reasoning overrides so the next agent
         # picks up configured defaults instead of previous session switches.
@@ -171,7 +179,11 @@ class GatewaySlashCommandsMixin:
             header = self._telegram_topic_new_header(source) or t("gateway.reset.header_new")
 
         # Set session title if provided with /new <title>
-        _title_arg = event.get_command_args().strip()
+        _title_arg = (
+            title_arg_override
+            if title_arg_override is not None
+            else event.get_command_args().strip()
+        )
         _title_note = ""
         if _title_arg and self._session_db and new_entry:
             from hermes_state import SessionDB
@@ -229,6 +241,99 @@ class GatewaySlashCommandsMixin:
         if session_info:
             return EphemeralReply(f"{header}\n\n{session_info}{_tip_line}")
         return EphemeralReply(f"{header}{_tip_line}")
+
+    def _build_gateway_handoff_packet(
+        self,
+        *,
+        session_id: str,
+        history: list[dict[str, Any]],
+        note: str = "",
+    ) -> str:
+        """Build deterministic reference context for /handoff.
+
+        Gateway slash commands must not call the LLM just to rotate context.
+        This follows the session-handoff skill template with conservative,
+        redacted handles and a small recent-message window.
+        """
+        try:
+            from agent.redact import redact_sensitive_text
+        except Exception:
+            def redact_sensitive_text(x: str) -> str:  # type: ignore[no-redef]
+                return x
+
+        def clean(text: object, limit: int = 900) -> str:
+            raw = str(text or "").strip()
+            raw = re.sub(r"\s+", " ", raw)
+            raw = redact_sensitive_text(raw)
+            if len(raw) > limit:
+                raw = raw[: limit - 1].rstrip() + "…"
+            return raw
+
+        user_msgs = [m for m in history if m.get("role") == "user"]
+        assistant_msgs = [m for m in history if m.get("role") == "assistant"]
+        latest_user = clean(user_msgs[-1].get("content"), 500) if user_msgs else "not available"
+        latest_assistant = clean(assistant_msgs[-1].get("content"), 700) if assistant_msgs else "not available"
+
+        recent_lines: list[str] = []
+        for msg in history[-8:]:
+            role = str(msg.get("role") or "message")
+            content = clean(msg.get("content"), 360)
+            if content:
+                recent_lines.append(f"  - {role}: {content}")
+        recent = "\n".join(recent_lines) if recent_lines else "  - no recent transcript rows available"
+        objective = clean(note, 250) if note else "Continue the prior Telegram session safely in a fresh context window."
+
+        return "\n".join([
+            "## Session Handoff",
+            f"- Objective: {objective}",
+            f"- Current state: Fresh gateway session created from prior session `{session_id}` via `/handoff`. Treat this packet as reference context, not a new user request. Latest user turn before handoff: {latest_user}",
+            "- Decisions locked: Preserve explicit approvals, denials, and safety/privacy boundaries from the prior session. Do not infer missing approval for gateway restarts, credential/config changes, external sends, payments, trades, or remote-host mutations.",
+            "- Files/artifacts touched: See prior session transcript for exact paths. If a path/status matters, inspect the artifact or use `session_search` with the prior session id before acting.",
+            "- Commands/tests already run: Not exhaustively replayed by `/handoff`; verify live state before claiming success or continuing implementation.",
+            f"- Verification evidence: Prior final assistant turn before handoff: {latest_assistant}",
+            "- Open risks: This is a deterministic handoff summary, not a full transcript. It may omit details; use session_search/read-back for anything consequential.",
+            "- Blocked/gated items: Gateway restart is still approval-gated unless Nathan explicitly asks in the new session. Secrets/credentials must remain redacted.",
+            "- Recent transcript window:",
+            recent,
+            "- Next exact action: Read Nathan's next message in the fresh session and continue from this packet; if implementation state matters, inspect files/tests before acting.",
+        ])
+
+    async def _handle_handoff_command(self, event: MessageEvent) -> Union[str, EphemeralReply]:
+        """Handle gateway /handoff: start fresh and inject a handoff packet."""
+        if not self._session_db:
+            from hermes_state import format_session_db_unavailable
+            return format_session_db_unavailable(prefix="Cannot create handoff: ")
+
+        source = event.source
+        session_key = self._session_key_for_source(source)
+        current_entry = self.session_store.get_or_create_session(source)
+        history = self.session_store.load_transcript(current_entry.session_id)
+        if not history:
+            return "No prior transcript to hand off. Use `/new` for a plain fresh session."
+
+        note = event.get_command_args().strip()
+        packet = self._build_gateway_handoff_packet(
+            session_id=current_entry.session_id,
+            history=history,
+            note=note,
+        )
+        reply = await self._handle_reset_command(
+            event,
+            handoff_context=packet,
+            title_arg_override="handoff",
+        )
+
+        new_entry = self.session_store._entries.get(session_key)
+        new_sid = new_entry.session_id if new_entry else "unknown"
+        text = (
+            "Handoff ready — started a fresh session with the packet injected as reference context.\n"
+            f"Old session: `{current_entry.session_id}`\n"
+            f"New session: `{new_sid}`\n\n"
+            "Send the next message normally; the new session will see the handoff packet automatically."
+        )
+        if isinstance(reply, EphemeralReply):
+            return EphemeralReply(text)
+        return text
 
     async def _handle_profile_command(self, event: MessageEvent) -> str:
         """Handle /profile — show active profile name and home directory."""

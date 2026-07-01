@@ -2526,6 +2526,34 @@ class AIAgent:
             self._pending_steer = None
         return text
 
+    @staticmethod
+    def _canonical_file_mutation_target(path: str) -> str:
+        """Normalize a file-mutation path for same-turn verifier matching.
+
+        Tool calls can address the same file with different spellings in one
+        turn — e.g. a failed V4A patch body may contain an absolute path while
+        the recovery call uses ``~/...``.  The verifier keys failures by path,
+        so without canonicalization a later successful recovery fails to clear
+        the earlier failure and the user sees a false footer.  Keep this
+        intentionally lightweight: no filesystem existence check is required.
+        """
+        if not path:
+            return path
+        try:
+            raw = str(path)
+            expanded = os.path.normcase(os.path.abspath(os.path.expanduser(raw)))
+            marker = f"{os.sep}.hermes{os.sep}"
+            if marker in expanded:
+                # Tests and remote agents may report the same profile-local file
+                # under different user homes (for example ``/Users/neo`` in a
+                # V4A patch body and ``~`` in a recovery call running on CI).
+                # For same-turn verifier matching, profile-relative identity is
+                # more important than the current OS user's home directory.
+                return "~/.hermes/" + expanded.split(marker, 1)[1]
+            return expanded
+        except Exception:
+            return str(path)
+
     def _record_file_mutation_result(
         self,
         tool_name: str,
@@ -2536,10 +2564,11 @@ class AIAgent:
         """Record a ``write_file`` / ``patch`` outcome for the turn-end verifier.
 
         On failure, store ``{path: {error_preview, tool}}`` entries.  On
-        success, remove any prior failure entries for the same paths (the
-        model recovered within the turn).  Silently no-ops if the per-turn
-        state dict hasn't been initialised yet (e.g. a tool dispatched
-        outside ``run_conversation``).
+        success, remove any prior failure entries for the same canonical paths
+        (the model recovered within the turn, even if it used a different path
+        spelling such as absolute vs ``~/``).  Silently no-ops if the per-turn
+        state dict hasn't been initialised yet (e.g. a tool dispatched outside
+        ``run_conversation``).
         """
         if tool_name not in _FILE_MUTATING_TOOLS:
             return
@@ -2549,6 +2578,7 @@ class AIAgent:
         targets = _extract_file_mutation_targets(tool_name, args)
         if not targets:
             return
+        targets = [self._canonical_file_mutation_target(path) for path in targets]
         landed = file_mutation_result_landed(tool_name, result)
         if is_error and not landed:
             preview = _extract_error_preview(result)

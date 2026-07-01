@@ -617,10 +617,11 @@ class TestLaunchdServiceRecovery:
             ["launchctl", "bootstrap", domain, str(plist_path)],
         ]
 
-    def test_refresh_defers_reload_when_running_inside_gateway_tree(self, tmp_path, monkeypatch):
-        """#43842: when the refresh runs inside the gateway's own process tree,
-        a direct bootout would kill this CLI before bootstrap. The reload must
-        be delegated to a detached helper instead."""
+    def test_refresh_skips_reload_when_running_inside_gateway_tree(self, tmp_path, monkeypatch):
+        """When the refresh runs inside the gateway's own process tree,
+        a direct bootout would kill the live gateway. The plist can be updated
+        on disk, but live launchd reload must be skipped until an external
+        shell starts the gateway."""
         plist_path = tmp_path / "ai.hermes.gateway.plist"
         plist_path.write_text("<plist>old content</plist>", encoding="utf-8")
 
@@ -663,14 +664,8 @@ class TestLaunchdServiceRecovery:
         assert "--replace" in plist_path.read_text(encoding="utf-8")
         # No DIRECT bootout/bootstrap ran (those would kill us mid-sequence).
         assert not [c for c in run_calls if "bootout" in c or "bootstrap" in c]
-        # Exactly one detached helper was spawned, in a new session, and it
-        # performs both bootout and bootstrap.
-        assert len(popen_calls) == 1
-        cmd, kwargs = popen_calls[0]
-        assert kwargs.get("start_new_session") is True
-        script = cmd[-1]
-        assert "bootout" in script and "bootstrap" in script
-        assert str(plist_path) in script
+        # No detached helper was spawned from inside the live gateway tree.
+        assert popen_calls == []
 
     def test_refresh_uses_direct_reload_when_not_inside_gateway_tree(self, tmp_path, monkeypatch):
         """Normal CLI-initiated refresh (outside the service tree) keeps the

@@ -11,7 +11,7 @@ so CLI and messaging platforms behave identically.
 import importlib
 import sys
 import types
-from datetime import datetime
+from datetime import datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import MagicMock, AsyncMock
 
@@ -20,7 +20,7 @@ import pytest
 from agent.model_metadata import estimate_messages_tokens_rough
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, SendResult
-from gateway.session import SessionEntry, SessionSource
+from gateway.session import SessionEntry, SessionSource, SessionStore
 
 
 # ---------------------------------------------------------------------------
@@ -951,3 +951,222 @@ async def test_session_hygiene_default_hard_message_limit_does_not_fire_at_12_me
     assert FakeCompressAgent.last_instance is None, (
         "Compression should NOT fire at 12 messages with default hard_limit=5000"
     )
+
+
+class TestTaskBoundarySessionHygiene:
+    def test_session_entry_fresh_start_round_trips(self):
+        armed_at = datetime.now()
+        entry = SessionEntry(
+            session_key="agent:main:telegram:dm:1",
+            session_id="s1",
+            created_at=armed_at,
+            updated_at=armed_at,
+            platform=Platform.TELEGRAM,
+            chat_type="dm",
+            fresh_start_armed=True,
+            fresh_start_reason="task_completed",
+            fresh_start_armed_at=armed_at,
+            fresh_start_summary="done",
+        )
+
+        restored = SessionEntry.from_dict(entry.to_dict())
+
+        assert restored.fresh_start_armed is True
+        assert restored.fresh_start_reason == "task_completed"
+        assert restored.fresh_start_armed_at is not None
+        assert restored.fresh_start_summary == "done"
+
+    def test_session_store_arm_and_clear_fresh_start(self, tmp_path):
+        store = SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
+        store._db = None
+        source = SessionSource(platform=Platform.TELEGRAM, chat_id="1", chat_type="dm")
+        entry = store.get_or_create_session(source)
+
+        assert store.arm_fresh_start(entry.session_key, "task_completed", "done")
+        armed = store.get_or_create_session(source)
+        assert armed.fresh_start_armed is True
+        assert armed.fresh_start_reason == "task_completed"
+        assert armed.fresh_start_summary == "done"
+
+        assert store.clear_fresh_start(entry.session_key)
+        cleared = store.get_or_create_session(source)
+        assert cleared.fresh_start_armed is False
+        assert cleared.fresh_start_reason is None
+        assert cleared.fresh_start_summary is None
+
+    def test_suggest_mode_does_not_auto_reset_for_armed_non_continuation(self):
+        from gateway.run import _should_auto_reset_for_session_hygiene
+
+        entry = SimpleNamespace(
+            fresh_start_armed=True,
+            fresh_start_armed_at=datetime.now() - timedelta(minutes=10),
+            resume_pending=False,
+            suspended=False,
+        )
+        event = SimpleNamespace(text="Plan Korea itinerary", reply_to_message_id=None)
+        cfg = {
+            "session_hygiene": {
+                "enabled": True,
+                "auto_fresh": {
+                    "enabled": True,
+                    "grace_minutes": 5,
+                    "preserve_on_reply_to_bot": True,
+                    "preserve_on_continuation_phrases": True,
+                },
+            }
+        }
+
+        assert _should_auto_reset_for_session_hygiene(entry, event, cfg) is False
+
+    def test_auto_mode_can_still_auto_reset_when_explicitly_enabled(self):
+        from gateway.run import _should_auto_reset_for_session_hygiene
+
+        entry = SimpleNamespace(
+            fresh_start_armed=True,
+            fresh_start_armed_at=datetime.now() - timedelta(minutes=10),
+            resume_pending=False,
+            suspended=False,
+        )
+        event = SimpleNamespace(text="Plan Korea itinerary", reply_to_message_id=None)
+        cfg = {
+            "session_hygiene": {
+                "enabled": True,
+                "mode": "auto",
+                "auto_fresh": {"enabled": True, "grace_minutes": 5},
+            }
+        }
+
+        assert _should_auto_reset_for_session_hygiene(entry, event, cfg) is True
+
+    def test_auto_reset_preserves_obvious_continuation(self):
+        from gateway.run import _should_auto_reset_for_session_hygiene
+
+        entry = SimpleNamespace(
+            fresh_start_armed=True,
+            fresh_start_armed_at=datetime.now() - timedelta(minutes=10),
+            resume_pending=False,
+            suspended=False,
+        )
+        event = SimpleNamespace(text="also add Lucky", reply_to_message_id=None)
+        cfg = {
+            "session_hygiene": {
+                "enabled": True,
+                "auto_fresh": {"enabled": True, "preserve_on_continuation_phrases": True},
+            }
+        }
+
+        assert _should_auto_reset_for_session_hygiene(entry, event, cfg) is False
+
+    def test_arm_reason_task_completed_requires_tool_and_done_language(self):
+        from gateway.run import _session_hygiene_arm_reason
+
+        cfg = {
+            "session_hygiene": {
+                "enabled": True,
+                "auto_fresh": {"enabled": True},
+                "budget_backstop": {"enabled": True},
+            }
+        }
+        messages = [
+            {"role": "assistant", "tool_calls": [{"function": {"name": "write_file"}}]},
+            {"role": "tool", "tool_name": "write_file", "content": "ok"},
+        ]
+        result = {"api_calls": 2, "input_tokens": 100, "output_tokens": 50}
+
+        assert _session_hygiene_arm_reason("Done — verified with /tmp/demo.py.", result, messages, cfg) == "task_completed:evidence"
+        assert _session_hygiene_arm_reason("Which calendar should I use?", result, messages, cfg) is None
+
+    def test_arm_reason_ignores_budget_backstop_without_evidence(self):
+        from gateway.run import _session_hygiene_arm_reason
+
+        cfg = {
+            "session_hygiene": {
+                "enabled": True,
+                "auto_fresh": {"enabled": False},
+                "budget_backstop": {"enabled": True, "max_api_calls": 3},
+            }
+        }
+        result = {"api_calls": 4, "input_tokens": 100, "output_tokens": 50}
+
+        assert _session_hygiene_arm_reason("Still working summary", result, [], cfg) is None
+
+    def test_suggest_fresh_session_requires_new_task_and_preserves_continuations(self):
+        from gateway.run import _should_suggest_fresh_session_for_session_hygiene
+
+        entry = SimpleNamespace(
+            fresh_start_armed=True,
+            fresh_start_summary="## Session Handoff\n- Previous session id: `old`\n- Objective: Tarot trainer app finished",
+            fresh_start_armed_at=datetime.now() - timedelta(minutes=10),
+            resume_pending=False,
+            suspended=False,
+        )
+        cfg = {"session_hygiene": {"enabled": True, "mode": "suggest"}}
+
+        keep = SimpleNamespace(text="Great work. What else can we add to the tarot trainer?", reply_to_message_id=None, get_command=lambda: None)
+        ask = SimpleNamespace(text="Can you research Seoul restaurants for tomorrow night?", reply_to_message_id=None, get_command=lambda: None)
+
+        assert _should_suggest_fresh_session_for_session_hygiene(entry, keep, cfg) is False
+        assert _should_suggest_fresh_session_for_session_hygiene(entry, ask, cfg) is True
+
+    def test_handoff_context_round_trips_and_prompt_seeds_reference_packet(self):
+        from gateway.session import build_session_context, build_session_context_prompt
+
+        now = datetime.now()
+        entry = SessionEntry(
+            session_key="agent:main:telegram:dm:1",
+            session_id="s1",
+            created_at=now,
+            updated_at=now,
+            platform=Platform.TELEGRAM,
+            chat_type="dm",
+            handoff_context="## Session Handoff\n- Objective: continue safely",
+        )
+
+        restored = SessionEntry.from_dict(entry.to_dict())
+        assert restored.handoff_context == "## Session Handoff\n- Objective: continue safely"
+
+        source = SessionSource(platform=Platform.TELEGRAM, chat_id="1", chat_type="dm")
+        context = build_session_context(source, GatewayConfig(), restored)
+        prompt = build_session_context_prompt(context)
+
+        assert "## Previous Session Handoff" in prompt
+        assert "Reference-only continuation packet" in prompt
+        assert "- Objective: continue safely" in prompt
+
+    def test_reset_session_can_seed_handoff_context(self, tmp_path):
+        store = SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
+        store._db = None
+        source = SessionSource(platform=Platform.TELEGRAM, chat_id="1", chat_type="dm")
+        entry = store.get_or_create_session(source)
+
+        new_entry = store.reset_session(
+            entry.session_key,
+            handoff_context="## Session Handoff\n- Next exact action: verify",
+        )
+
+        assert new_entry is not None
+        assert new_entry.session_id != entry.session_id
+        assert new_entry.handoff_context == "## Session Handoff\n- Next exact action: verify"
+        assert new_entry.fresh_start_armed is False
+
+    def test_build_session_hygiene_handoff_packet_is_mechanical(self):
+        from gateway.run import _build_session_hygiene_handoff_packet
+
+        messages = [
+            {"role": "user", "content": "Patch /tmp/demo.py and run tests"},
+            {"role": "assistant", "tool_calls": [{"function": {"name": "write_file"}}]},
+            {"role": "tool", "tool_name": "terminal", "content": "pytest passed"},
+        ]
+        packet = _build_session_hygiene_handoff_packet(
+            "Done — wrote /tmp/demo.py and verified with pytest.",
+            {"input_tokens": 120000, "output_tokens": 800, "api_calls": 12},
+            messages,
+            "budget_backstop:tokens",
+        )
+
+        assert packet.startswith("## Session Handoff")
+        assert "Latest user turn: Patch /tmp/demo.py and run tests" in packet
+        assert "`/tmp/demo.py`" in packet
+        assert "write_file, terminal" in packet
+        assert "input: 120000" in packet
+        assert "Next exact action" in packet
