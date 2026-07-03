@@ -209,8 +209,15 @@ _SESSION_HYGIENE_NEW_TASK_RE = re.compile(
 _SESSION_HYGIENE_WORD_RE = re.compile(r"[A-Za-z][A-Za-z0-9_-]{3,}|[\u4e00-\u9fff]{2,}")
 _SESSION_HYGIENE_STOPWORDS = {
     "this", "that", "with", "from", "have", "what", "when", "where", "would",
-    "could", "should", "please", "work", "great", "done", "make", "help", "need",
+    "could", "should", "please", "work", "working", "great", "done", "make",
+    "help", "need", "across", "correctly", "automatically",
     "session", "hermes", "agent", "user", "latest", "previous", "current",
+    # Handoff packets are mechanical templates. Do not let template/scaffold
+    # vocabulary make a genuinely new task look like a continuation.
+    "handoff", "objective", "state", "decisions", "locked",
+    "artifacts", "touched", "already", "verification",
+    "evidence", "risks", "blocked", "gated", "items", "next", "exact",
+    "action", "input", "output", "tokens", "reason", "summary",
 }
 
 
